@@ -1360,6 +1360,15 @@ async def post_mod_log(
             ),
             inline=False,
         )
+        # which warning this is for the person (the number of their warnings up to and including this case)
+        warnings = db.execute(
+            "SELECT COUNT(*) FROM mod_cases WHERE target_id=? AND action='warn' AND id<=? AND (guild_id=? OR guild_id=0) AND reported!=2",
+            (target_id, case_id, guild.id),
+        ).fetchone()[0]
+        if action == "warn":
+            embed.add_field(name="Warning", value=f"#{warnings} of this user", inline=False)
+        elif warnings:
+            embed.add_field(name="Warnings so far", value=str(warnings), inline=False)
         embed.add_field(name="Moderator", value=(moderator or "-")[:100], inline=True)
         embed.add_field(
             name="Source",
