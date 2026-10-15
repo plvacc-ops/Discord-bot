@@ -1728,8 +1728,11 @@ async def sync_commands() -> None:
 
 
 def get_guild() -> discord.Guild | None:
-    if GUILD_ID.isdigit():
-        return client.get_guild(int(GUILD_ID))
+    """The server the panel actions and the moderation timers work on: the Server ID from CoreOPS, else GUILD_ID from .env,
+    else the only server the bot is on."""
+    guild_id = setting_id("guild_id", 0) or (int(GUILD_ID) if GUILD_ID.isdigit() else 0)
+    if guild_id:
+        return client.get_guild(guild_id)
     return client.guilds[0] if len(client.guilds) == 1 else None
 
 
@@ -1781,6 +1784,7 @@ def build_report() -> dict:
             "started_at": STARTED_AT,
             "latency_ms": None if latency is None or math.isnan(latency) else round(latency * 1000),
             "guild": {"name": guild.name, "members": guild.member_count} if guild else None,
+            "guilds": [{"id": str(g.id), "name": g.name} for g in client.guilds[:25]],  # to pick the Server ID from
         },
         "polls": polls,
         "access": access,
@@ -1803,7 +1807,7 @@ async def run_action(action: dict) -> tuple[bool, str]:
     if kind == "poll_create":
         guild = get_guild()
         if guild is None:
-            return False, "The bot cannot find the server (check GUILD_ID)."
+            return False, "The bot cannot find the server - set the Server ID in CoreOPS (Discord bot -> Settings) or GUILD_ID in the bot's .env."
         poll_id, channel, _ = await create_poll(
             guild,
             0,  # 0 = created from the panel
@@ -1841,7 +1845,7 @@ async def run_action(action: dict) -> tuple[bool, str]:
     if kind == "mod_action":
         guild = get_guild()
         if guild is None:
-            return False, "The bot cannot find the server (check GUILD_ID)."
+            return False, "The bot cannot find the server - set the Server ID in CoreOPS (Discord bot -> Settings) or GUILD_ID in the bot's .env."
         uid = str(payload.get("user_id", ""))
         if not re.fullmatch(r"\d{17,20}", uid):
             return False, "Wrong user ID."
