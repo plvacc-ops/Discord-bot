@@ -221,6 +221,10 @@ try:  # older databases: the poll's header message (deleted after the results)
     db.execute("ALTER TABLE polls ADD COLUMN header_id INTEGER")
 except sqlite3.OperationalError:
     pass
+try:  # older databases: warnings that were cleared with /mod clearwarns (kept in the history)
+    db.execute("ALTER TABLE mod_cases ADD COLUMN cleared INTEGER NOT NULL DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
 try:  # older databases: the server a case belongs to (the timers work per case)
     db.execute("ALTER TABLE mod_cases ADD COLUMN guild_id INTEGER NOT NULL DEFAULT 0")
 except sqlite3.OperationalError:
@@ -1192,6 +1196,7 @@ MOD_ACTIONS = {
     "kick": ("👢", "Kick"),
     "ban": ("🔨", "Ban"),
     "unban": ("✅", "Ban removed"),
+    "clearwarns": ("🧹", "Warnings cleared"),
 }
 # titles of the private message sent to the punished person
 MOD_DM_TITLES = {
@@ -1202,6 +1207,7 @@ MOD_DM_TITLES = {
     "kick": "Removed from the server",
     "ban": "Ban",
     "unban": "Ban removed",
+    "clearwarns": "Warnings cleared",
 }
 MOD_NEEDS_REASON = {"warn", "mute", "timeout", "kick", "ban"}
 MOD_TAKES_DURATION = {"mute", "timeout", "ban"}
@@ -1276,7 +1282,7 @@ def mod_embed(guild: discord.Guild, action: str, case_id: int, reason: str, expi
     if panel_settings.get("mod_show_moderator") and moderator:
         embed.add_field(name="Moderator", value=moderator[:100], inline=False)
     appeal = str(panel_settings.get("mod_appeal_text") or "").strip()
-    if appeal and action not in ("unmute", "unban"):
+    if appeal and action not in ("unmute", "unban", "clearwarns"):
         embed.add_field(name="Appeal", value=appeal[:500], inline=False)
     embed.set_footer(text=f"{ORG_NAME} • #{case_id}")
     return embed
@@ -1362,7 +1368,7 @@ async def post_mod_log(
         )
         # which warning this is for the person (the number of their warnings up to and including this case)
         warnings = db.execute(
-            "SELECT COUNT(*) FROM mod_cases WHERE target_id=? AND action='warn' AND id<=? AND (guild_id=? OR guild_id=0) AND reported!=2",
+            "SELECT COUNT(*) FROM mod_cases WHERE target_id=? AND action='warn' AND cleared=0 AND id<=? AND (guild_id=? OR guild_id=0) AND reported!=2",
             (target_id, case_id, guild.id),
         ).fetchone()[0]
         if action == "warn":
@@ -1447,7 +1453,7 @@ async def apply_moderation(
                 member = await guild.fetch_member(target_id)
             except discord.NotFound:
                 member = None
-    if member is None and action not in ("ban", "unban"):
+    if member is None and action not in ("ban", "unban", "clearwarns"):
         raise UserError("This user is not on the server.")
     if member is not None and action in ("mute", "timeout", "kick", "ban"):
         if member.id == guild.owner_id:
@@ -1465,6 +1471,14 @@ async def apply_moderation(
         if muted_role is not None and (muted_role >= me.top_role or muted_role.managed):
             raise UserError("The bot cannot assign the Muted role - it is above the bot's role.")
 
+    if action == "clearwarns":
+        active_warnings = db.execute(
+            "SELECT COUNT(*) FROM mod_cases WHERE target_id=? AND action='warn' AND cleared=0 AND (guild_id=? OR guild_id=0) AND reported!=2",
+            (target_id, guild.id),
+        ).fetchone()[0]
+        if not active_warnings:
+            raise UserError("This user has no active warnings.")
+        reason = (f"{reason} " if reason else "") + f"({active_warnings} warning{'s' if active_warnings != 1 else ''} cleared)"
     expires_ts = int(time.time()) + duration_s if duration_s else None
     target_name = str(member) if member else ""
     if not target_name:
@@ -1505,6 +1519,11 @@ async def apply_moderation(
                 await guild.unban(discord.Object(target_id), reason=audit_reason)
             except discord.NotFound:
                 raise UserError("This user is not banned.")
+        elif action == "clearwarns":
+            db.execute(
+                "UPDATE mod_cases SET cleared=1 WHERE target_id=? AND action='warn' AND cleared=0 AND (guild_id=? OR guild_id=0)",
+                (target_id, guild.id),
+            )
         if action not in ("kick", "ban"):
             dm = await send_mod_dm(target_id, embed)
     except UserError:
@@ -1632,18 +1651,24 @@ async def mod_unban(interaction: discord.Interaction, user: discord.User, reason
     await run_mod_command(interaction, "unban", user, reason or "")
 
 
+@mod_group.command(name="clearwarns", description="Clear a user's warnings (they stay in the history)")
+@app_commands.describe(user="Whose warnings to clear", reason="Reason (optional)")
+async def mod_clearwarns(interaction: discord.Interaction, user: discord.User, reason: str | None = None):
+    await run_mod_command(interaction, "clearwarns", user, reason or "")
+
+
 @mod_group.command(name="history", description="A user's penalty history")
 @app_commands.describe(user="Whose history to show")
 async def mod_history(interaction: discord.Interaction, user: discord.User):
     if not is_moderator(interaction):
         return await interaction.response.send_message(no_permission_text(), ephemeral=True, allowed_mentions=NO_PINGS)
     rows = db.execute(
-        "SELECT id, ts, action, reason, mod_name FROM mod_cases WHERE target_id=? AND reported!=2 ORDER BY id DESC LIMIT 10",
+        "SELECT id, ts, action, reason, mod_name, cleared FROM mod_cases WHERE target_id=? AND reported!=2 ORDER BY id DESC LIMIT 10",
         (user.id,),
     ).fetchall()
     lines = [
-        f"**#{i}** <t:{ts}:d> {MOD_ACTIONS.get(action, ('', action))[1]}: {(reason or '-')[:80]} ({mod[:30]})"
-        for i, ts, action, reason, mod in rows
+        f"**#{i}** <t:{ts}:d> {MOD_ACTIONS.get(action, ('', action))[1]}{' (cleared)' if cleared else ''}: {(reason or '-')[:80]} ({mod[:30]})"
+        for i, ts, action, reason, mod, cleared in rows
     ]
     await interaction.response.send_message(
         "\n".join(lines) or "No cases for this user.", ephemeral=True, allowed_mentions=NO_PINGS
