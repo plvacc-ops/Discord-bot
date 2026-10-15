@@ -105,6 +105,16 @@ def setting_id(name: str, default: int) -> int:
     return int(value) if value.isdigit() else default
 
 
+def role_id_list(name: str) -> list[int]:
+    """A setting that holds one or several role IDs separated by commas / spaces."""
+    raw = str(panel_settings.get(name) or "")
+    return [int(part) for part in re.split(r"[,\s]+", raw) if part.isdigit()]
+
+
+def moderator_role_ids() -> set[int]:
+    return set(role_id_list("moderator_role_id"))
+
+
 def board_role_id() -> int:
     return setting_id("board_role_id", BOARD_ROLE_ID)
 
@@ -1176,10 +1186,10 @@ def parse_duration(text) -> int | None:
 
 def no_permission_text() -> str:
     """The reply to someone who may not moderate - and what the bot knows, so a wrong setup is easy to spot."""
-    role_id = setting_id("moderator_role_id", 0)
+    allowed = [board_role_id(), *sorted(moderator_role_ids())]
     lines = ["You do not have permission to moderate."]
-    if role_id:
-        lines.append(f"Moderator role set in CoreOPS: <@&{role_id}> - you do not have it.")
+    if moderator_role_ids():
+        lines.append("Allowed roles (Board + moderator roles from CoreOPS): " + ", ".join(f"<@&{i}>" for i in allowed) + " - you have none of them.")
     else:
         lines.append(
             "No moderator role is set in CoreOPS (Configuration → Discord bot → Settings), "
@@ -1202,8 +1212,8 @@ def is_moderator(interaction: discord.Interaction) -> bool:
         return False
     if is_board(interaction) or user.guild_permissions.administrator:
         return True
-    role_id = setting_id("moderator_role_id", 0)
-    return bool(role_id) and any(r.id == role_id for r in user.roles)
+    allowed = moderator_role_ids()
+    return bool(allowed) and any(r.id in allowed for r in user.roles)
 
 
 def mod_embed(guild: discord.Guild, action: str, case_id: int, reason: str, expires_ts: int | None, moderator: str):
@@ -1553,7 +1563,7 @@ def role_problem(guild: discord.Guild, role: discord.Role | None) -> str | None:
         return "there is no such role on the server"
     if role.is_default() or role.managed:
         return "it is a system or integration role"
-    reserved = {i for i in (board_role_id(), setting_id("moderator_role_id", 0), setting_id("muted_role_id", 0)) if i}
+    reserved = {i for i in (board_role_id(), setting_id("muted_role_id", 0), *moderator_role_ids()) if i}
     if role.id in reserved:
         return "this role is reserved (Board / moderator / Muted)"
     me = guild.me
@@ -1734,13 +1744,18 @@ def effective_roles() -> dict:
     """The roles the bot actually uses (after the settings from CoreOPS), with their names on the server."""
     guild = get_guild()
     out = {}
-    for key, role_id in (
-        ("board", board_role_id()),
-        ("moderator", setting_id("moderator_role_id", 0)),
-        ("muted", setting_id("muted_role_id", 0)),
+    for key, role_ids in (
+        ("board", [board_role_id()]),
+        ("moderator", role_id_list("moderator_role_id")),
+        ("muted", [setting_id("muted_role_id", 0)]),
     ):
-        role = guild.get_role(role_id) if guild and role_id else None
-        out[key] = {"id": str(role_id) if role_id else "", "name": role.name if role else None}
+        role_ids = [i for i in role_ids if i]
+        roles = [guild.get_role(i) if guild else None for i in role_ids]
+        out[key] = {
+            "id": ",".join(str(i) for i in role_ids),
+            "name": ", ".join(r.name for r in roles if r) or None,
+            "missing": [str(i) for i, r in zip(role_ids, roles) if r is None],
+        }
     return out
 
 
