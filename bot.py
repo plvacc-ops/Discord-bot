@@ -23,7 +23,8 @@ from dotenv import load_dotenv
 # ----------------------------------------------------------------------------
 load_dotenv(Path(__file__).with_name(".env"))
 TOKEN = os.getenv("DISCORD_TOKEN", "")
-GUILD_ID = os.getenv("GUILD_ID", "875305430321086485")
+_guild_match = re.search(r"\d{17,20}", os.getenv("GUILD_ID", "875305430321086485"))  # tolerant of quotes / spaces in .env
+GUILD_ID = _guild_match.group() if _guild_match else ""
 
 BOARD_ROLE_ID = int(os.getenv("BOARD_ROLE_ID", "1394941236284227604"))  # Board role - manages the poll access list
 PILOT_ROLES = {
@@ -1715,25 +1716,39 @@ last_sync_error = ""  # why the last exchange failed (empty = it worked)
 _commands_copied = False
 
 
+commands_error = ""  # why the slash commands could not be registered (empty = fine)
+
+
 async def sync_commands() -> None:
-    global _commands_copied
-    if GUILD_ID:
-        guild = discord.Object(int(GUILD_ID))
-        if not _commands_copied:  # copy_global_to must not be called twice (CommandAlreadyRegistered)
-            tree.copy_global_to(guild=guild)
-            _commands_copied = True
-        await tree.sync(guild=guild)
-    else:
-        await tree.sync()
+    global _commands_copied, commands_error
+    try:
+        if GUILD_ID:
+            guild = discord.Object(int(GUILD_ID))
+            if not _commands_copied:  # copy_global_to must not be called twice (CommandAlreadyRegistered)
+                tree.copy_global_to(guild=guild)
+                _commands_copied = True
+            await tree.sync(guild=guild)
+        else:
+            await tree.sync()
+        commands_error = ""
+    except (discord.HTTPException, app_commands.AppCommandError) as error:
+        # do not let this kill the bot: it still has to connect to CoreOPS so the problem is visible in the panel
+        commands_error = f"{type(error).__name__}: {error}"[:300]
+        log.error("Could not register the slash commands: %s", commands_error)
+        if GUILD_ID:
+            log.error(
+                "Is the bot on server %s, and was it invited with the 'bot' and 'applications.commands' scopes?", GUILD_ID
+            )
 
 
 def get_guild() -> discord.Guild | None:
     """The server the panel actions and the moderation timers work on: the Server ID from CoreOPS, else GUILD_ID from .env,
     else the only server the bot is on."""
     guild_id = setting_id("guild_id", 0) or (int(GUILD_ID) if GUILD_ID.isdigit() else 0)
-    if guild_id:
-        return client.get_guild(guild_id)
-    return client.guilds[0] if len(client.guilds) == 1 else None
+    guild = client.get_guild(guild_id) if guild_id else None
+    if guild is None and len(client.guilds) == 1:  # a wrong or missing ID does not matter when the bot is on one server only
+        return client.guilds[0]
+    return guild
 
 
 def role_status(guild: discord.Guild | None, role_id: int) -> dict:
@@ -1785,6 +1800,7 @@ def build_report() -> dict:
             "latency_ms": None if latency is None or math.isnan(latency) else round(latency * 1000),
             "guild": {"name": guild.name, "members": guild.member_count} if guild else None,
             "guilds": [{"id": str(g.id), "name": g.name} for g in client.guilds[:25]],  # to pick the Server ID from
+            "commands_error": commands_error,
         },
         "polls": polls,
         "access": access,
