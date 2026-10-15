@@ -49,7 +49,8 @@ DB_PATH = Path(__file__).with_name("tapeta.db")
 
 WEATHER_API = "https://aviationweather.gov/api/data"
 BOOKINGS_API = "https://atc-bookings.vatsim.net/api/booking"
-USER_AGENT = "PolishVACC-DiscordBot/2.0"
+# Uwaga: User-Agent bez słowa "DiscordBot" - zapora hostingu CoreOPS traktuje je jako podszywanie się pod crawler Discorda i zwraca 406.
+USER_AGENT = "PLVACC-CoreOPS/2.1 (+https://plvacc.pl)"
 
 NO_PINGS = discord.AllowedMentions.none()
 
@@ -1156,7 +1157,13 @@ async def coreops_request(report: dict) -> dict | None:
             f"{COREOPS_URL}/api/bot.php", json=report, headers={"Authorization": f"Bearer {COREOPS_TOKEN}"}
         ) as response:
             if response.status != 200:
-                log.warning("CoreOPS odpowiedział kodem %s", response.status)
+                hint = {
+                    401: " - zły COREOPS_TOKEN (musi być taki sam jak bot.api_token w config.php)",
+                    403: " - zapora hostingu albo allowed_ips w CoreOPS blokuje to połączenie",
+                    406: " - zapora hostingu CoreOPS zablokowała żądanie",
+                    503: " - w config.php CoreOPS brakuje bot.api_token (min. 32 znaki)",
+                }.get(response.status, "")
+                log.warning("CoreOPS odpowiedział kodem %s%s", response.status, hint)
                 return None
             data = await response.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
