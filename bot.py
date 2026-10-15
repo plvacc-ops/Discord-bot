@@ -1296,7 +1296,7 @@ _cid_cache: dict[int, tuple[float, str | None]] = {}
 
 
 async def vatsim_cid(discord_id: int) -> str | None:
-    """VATSIM ID (PID) of a Discord user from the VATSIM Core API (GET /members/discord/{id}).
+    """VATSIM ID (PID) of a Discord user from the VATSIM Core API (GET /members/discord/{discord_id}).
 
     Returns the ID, \"\" when the person has not linked Discord on VATSIM (404), None when the API could not be asked.
     """
@@ -1311,8 +1311,10 @@ async def vatsim_cid(discord_id: int) -> str | None:
         ) as response:
             if response.status == 200:
                 data = await response.json(content_type=None)
-                value = str(data.get("id") or "") if isinstance(data, dict) else ""
-                if value.isdigit():
+                # the record is {"id": <Discord ID>, "user_id": <VATSIM ID>}; take the number that is not the Discord ID itself
+                candidates = [str(data.get("user_id") or ""), str(data.get("id") or "")] if isinstance(data, dict) else []
+                value = next((c for c in candidates if c.isdigit() and c != str(discord_id)), "")
+                if value:
                     result, ttl = value, 1800
             elif response.status == 404:
                 result, ttl = "", 300
@@ -1352,7 +1354,7 @@ async def post_mod_log(
         embed.add_field(
             name="VATSIM ID (PID)",
             value=(
-                f"[{cid}](https://stats.vatsim.net/stats/{cid})"
+                cid
                 if cid
                 else "not linked (the user has not connected Discord on VATSIM)" if cid == "" else "unavailable (VATSIM API)"
             ),
