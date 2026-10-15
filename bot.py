@@ -1142,6 +1142,16 @@ MOD_ACTIONS = {
     "ban": ("🔨", "Ban"),
     "unban": ("✅", "Zdjęcie bana"),
 }
+# wiadomość prywatna do ukaranego jest po angielsku
+MOD_DM_TITLES = {
+    "warn": "Warning",
+    "mute": "Mute",
+    "unmute": "Mute removed",
+    "timeout": "Timeout",
+    "kick": "Removed from the server",
+    "ban": "Ban",
+    "unban": "Ban removed",
+}
 MOD_NEEDS_REASON = {"warn", "mute", "timeout", "kick", "ban"}
 MOD_TAKES_DURATION = {"mute", "timeout", "ban"}
 MAX_TIMEOUT_SECONDS = 28 * 86400
@@ -1174,20 +1184,21 @@ def is_moderator(interaction: discord.Interaction) -> bool:
 
 
 def mod_embed(guild: discord.Guild, action: str, case_id: int, reason: str, expires_ts: int | None, moderator: str):
-    emoji, title = MOD_ACTIONS[action]
-    embed = discord.Embed(title=f"{emoji} {title}", description=f"Serwer: **{guild.name}**", color=EMBED_COLOR)
+    emoji = MOD_ACTIONS[action][0]
+    title = MOD_DM_TITLES[action]
+    embed = discord.Embed(title=f"{emoji} {title}", description=f"Server: **{guild.name}**", color=EMBED_COLOR)
     if reason:
-        embed.add_field(name="Powód", value=reason[:1000], inline=False)
+        embed.add_field(name="Reason", value=reason[:1000], inline=False)
     if expires_ts:
-        embed.add_field(name="Obowiązuje do", value=f"<t:{expires_ts}:F> (<t:{expires_ts}:R>)", inline=False)
+        embed.add_field(name="In effect until", value=f"<t:{expires_ts}:F> (<t:{expires_ts}:R>)", inline=False)
     elif action in ("mute", "ban"):
-        embed.add_field(name="Czas", value="bezterminowo", inline=False)
+        embed.add_field(name="Duration", value="permanent", inline=False)
     if panel_settings.get("mod_show_moderator") and moderator:
         embed.add_field(name="Moderator", value=moderator[:100], inline=False)
     appeal = str(panel_settings.get("mod_appeal_text") or "").strip()
     if appeal and action not in ("unmute", "unban"):
-        embed.add_field(name="Odwołanie", value=appeal[:500], inline=False)
-    embed.set_footer(text=f"{ORG_NAME} • sprawa #{case_id}")
+        embed.add_field(name="Appeal", value=appeal[:500], inline=False)
+    embed.set_footer(text=f"{ORG_NAME} • case #{case_id}")
     return embed
 
 
