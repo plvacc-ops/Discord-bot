@@ -1,0 +1,1238 @@
+"""Bot Polish VACC: głosowania na tapetę miesiąca, METAR/TAF, rezerwacje ATC i role pilotów."""
+import asyncio
+import io
+import json
+import logging
+import math
+import os
+import re
+import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import tasks
+from dotenv import load_dotenv
+
+# ----------------------------------------------------------------------------
+# KONFIGURACJA
+# ----------------------------------------------------------------------------
+load_dotenv(Path(__file__).with_name(".env"))
+TOKEN = os.getenv("DISCORD_TOKEN", "")
+GUILD_ID = os.getenv("GUILD_ID", "875305430321086485")
+
+BOARD_ROLE_ID = int(os.getenv("BOARD_ROLE_ID", "1394941236284227604"))  # rola Board - zarządza uprawnieniami
+PILOT_ROLES = {
+    "training": int(os.getenv("TRAINING_PILOT_ROLE_ID", "1103329876053872780")),
+    "exam": int(os.getenv("EXAM_PILOT_ROLE_ID", "1103330255760007229")),
+}
+
+# Panel CoreOPS (Configuration -> Discord bot): bot łączy się z CoreOPS, pobiera ustawienia i polecenia, odsyła swój stan.
+# Bez COREOPS_URL i COREOPS_TOKEN działa samodzielnie (wszystkie funkcje włączone, wartości z .env).
+COREOPS_URL = os.getenv("COREOPS_URL", "").strip().rstrip("/")
+COREOPS_TOKEN = os.getenv("COREOPS_TOKEN", "").strip()
+SYNC_SECONDS = 15
+VERSION = "2.1-coreops"
+STARTED_AT = int(time.time())
+CONFIG_CACHE = Path(__file__).with_name("coreops_config.json")  # ostatnie ustawienia z panelu (gdy CoreOPS jest niedostępny)
+
+EMBED_COLOR = 0xBD0505
+ORG_NAME = "Polish VACC"
+VOTE_EMOJI = "👍"
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+TZ = timezone.utc  # wszystkie podawane daty i godziny są w UTC
+MIN_ENTRIES, MAX_ENTRIES = 3, 10
+DB_PATH = Path(__file__).with_name("tapeta.db")
+
+WEATHER_API = "https://aviationweather.gov/api/data"
+BOOKINGS_API = "https://atc-bookings.vatsim.net/api/booking"
+USER_AGENT = "PolishVACC-DiscordBot/2.0"
+
+NO_PINGS = discord.AllowedMentions.none()
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("plvacc-bot")
+
+# ----------------------------------------------------------------------------
+# USTAWIENIA Z PANELU COREOPS (puste = domyślne: wszystko włączone, wartości z .env)
+# ----------------------------------------------------------------------------
+COMMAND_FEATURES = {"tapeta": "tapeta", "metar": "metar", "taf": "taf", "bookings": "bookings", "rola": "rola"}
+panel_features: dict[str, bool] = {}
+panel_settings: dict = {}
+panel_rev = ""
+_cooldowns: dict[tuple[str, int], float] = {}
+
+
+def apply_panel_config(config: dict) -> None:
+    global panel_features, panel_settings, panel_rev
+    features, settings = config.get("features"), config.get("settings")
+    if isinstance(features, dict):
+        panel_features = {str(k): bool(v) for k, v in features.items()}
+    if isinstance(settings, dict):
+        panel_settings = dict(settings)
+    panel_rev = str(config.get("rev") or "")
+
+
+def load_config_cache() -> None:
+    try:
+        apply_panel_config(json.loads(CONFIG_CACHE.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+
+
+def feature_enabled(name: str) -> bool:
+    return panel_features.get(name, True)
+
+
+def setting_int(name: str, default: int) -> int:
+    try:
+        return int(panel_settings.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def setting_id(name: str, default: int) -> int:
+    value = str(panel_settings.get(name) or "").strip()
+    return int(value) if value.isdigit() else default
+
+
+def board_role_id() -> int:
+    return setting_id("board_role_id", BOARD_ROLE_ID)
+
+
+def pilot_role_id(kind: str) -> int:
+    return setting_id(f"{kind}_pilot_role_id", PILOT_ROLES[kind])
+
+
+def booking_prefixes() -> tuple[str, ...]:
+    parts = tuple(p for p in re.split(r"[,\s]+", str(panel_settings.get("bookings_prefix") or "EP").upper()) if p)
+    return parts or ("EP",)
+
+
+def poll_limits() -> tuple[int, int]:
+    low = max(1, setting_int("poll_min_entries", MIN_ENTRIES))
+    return low, max(low, setting_int("poll_max_entries", MAX_ENTRIES))
+
+
+def disabled_message() -> str:
+    return str(panel_settings.get("disabled_message") or "Ta funkcja jest chwilowo wyłączona.")[:200]
+
+
+def command_cooldown(name: str) -> int:
+    if name in ("metar", "taf"):
+        return max(0, setting_int("weather_cooldown", 5))
+    if name == "bookings":
+        return max(0, setting_int("bookings_cooldown", 10))
+    return 0
+
+
+class PlvaccTree(app_commands.CommandTree):
+    """Przed każdą komendą: czy funkcja jest włączona w panelu i czy użytkownik nie przekracza cooldownu."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        name = interaction.command.name if interaction.command else ""
+        feature = COMMAND_FEATURES.get(name)
+        if feature and not feature_enabled(feature):
+            await interaction.response.send_message(f"⛔ {disabled_message()}", ephemeral=True)
+            return False
+        seconds = command_cooldown(name)
+        if seconds > 0:
+            now = time.monotonic()
+            key = (name, interaction.user.id)
+            wait = _cooldowns.get(key, 0.0) - now
+            if wait > 0:
+                await interaction.response.send_message(f"Spróbuj ponownie za {math.ceil(wait)} s.", ephemeral=True)
+                return False
+            if len(_cooldowns) > 2000:
+                _cooldowns.clear()
+            _cooldowns[key] = now + seconds
+        return True
+
+# ----------------------------------------------------------------------------
+# BAZA DANYCH (SQLite - przetrwa restart bota)
+# ----------------------------------------------------------------------------
+db = sqlite3.connect(DB_PATH)
+db.executescript(
+    """
+    CREATE TABLE IF NOT EXISTS polls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        channel_id INTEGER NOT NULL,
+        end_ts INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_by INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS entries (
+        poll_id INTEGER NOT NULL,
+        number INTEGER NOT NULL,
+        vote_message_id INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS permissions (
+        user_id INTEGER PRIMARY KEY,
+        added_by INTEGER NOT NULL
+    );
+    """
+)
+db.commit()
+
+
+# ----------------------------------------------------------------------------
+# KLIENT
+# ----------------------------------------------------------------------------
+class PlvaccBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True  # bez tego bot nie widzi załączników w cudzych wiadomościach
+        super().__init__(intents=intents)
+        self.tree = PlvaccTree(self)
+        self.web: aiohttp.ClientSession | None = None
+
+    async def setup_hook(self):
+        self.web = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20), headers={"User-Agent": USER_AGENT}
+        )
+        load_config_cache()
+        await sync_commands()
+        check_polls.start()
+        coreops_sync.start()
+
+    async def close(self):
+        if self.web is not None:
+            await self.web.close()
+        await super().close()
+
+    async def on_ready(self):
+        log.info("Zalogowano jako %s", self.user)
+
+
+client = PlvaccBot()
+tree = client.tree
+
+
+class UserError(Exception):
+    """Błąd, który pokazujemy użytkownikowi."""
+
+
+# ----------------------------------------------------------------------------
+# POMOCNICZE: ZAPYTANIA HTTP Z KRÓTKIM CACHE
+# ----------------------------------------------------------------------------
+_cache: dict[tuple, tuple[float, object]] = {}
+
+
+async def fetch(url: str, params: dict | None = None, ttl: int = 60):
+    """GET zwracający sparsowany JSON albo None, gdy API nie ma danych (204 / pusta odpowiedź)."""
+    key = (url, tuple(sorted((params or {}).items())))
+    hit = _cache.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    try:
+        async with client.web.get(url, params=params) as response:
+            if response.status == 429:
+                raise UserError("Limit zapytań do API. Spróbuj ponownie za minutę.")
+            if response.status == 204:
+                result = None
+            else:
+                response.raise_for_status()
+                text = (await response.text()).strip()
+                result = json.loads(text) if text else None
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+        log.warning("API %s niedostępne: %s: %s", url, type(error).__name__, error)
+        raise UserError("Nie udało się pobrać danych z API. Spróbuj ponownie za chwilę.") from error
+    if len(_cache) > 500:
+        _cache.clear()
+    _cache[key] = (time.monotonic() + ttl, result)
+    return result
+
+
+# ----------------------------------------------------------------------------
+# UPRAWNIENIA
+# ----------------------------------------------------------------------------
+def is_board(interaction: discord.Interaction) -> bool:
+    return isinstance(interaction.user, discord.Member) and any(
+        r.id == board_role_id() for r in interaction.user.roles
+    )
+
+
+def is_allowed(interaction: discord.Interaction) -> bool:
+    if is_board(interaction):
+        return True
+    row = db.execute("SELECT 1 FROM permissions WHERE user_id=?", (interaction.user.id,)).fetchone()
+    return row is not None
+
+
+def extract_id(text: str) -> int:
+    m = re.search(r"\d{17,20}", text)
+    if not m:
+        raise UserError("Podaj poprawne ID użytkownika (lub oznacz go przez @).")
+    return int(m.group())
+
+
+async def grant_access(interaction: discord.Interaction, text: str):
+    if not is_board(interaction):
+        return await interaction.response.send_message("❌ Tylko rola **Board** może to robić.", ephemeral=True)
+    try:
+        uid = extract_id(text)
+    except UserError as e:
+        return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+    db.execute(
+        "INSERT OR REPLACE INTO permissions (user_id, added_by) VALUES (?, ?)", (uid, interaction.user.id)
+    )
+    db.commit()
+    await interaction.response.send_message(
+        f"✅ <@{uid}> (`{uid}`) może teraz tworzyć głosowania.", ephemeral=True, allowed_mentions=NO_PINGS
+    )
+
+
+async def revoke_access(interaction: discord.Interaction, text: str):
+    if not is_board(interaction):
+        return await interaction.response.send_message("❌ Tylko rola **Board** może to robić.", ephemeral=True)
+    try:
+        uid = extract_id(text)
+    except UserError as e:
+        return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+    db.execute("DELETE FROM permissions WHERE user_id=?", (uid,))
+    db.commit()
+    await interaction.response.send_message(
+        f"✅ Odebrano uprawnienia: <@{uid}> (`{uid}`).", ephemeral=True, allowed_mentions=NO_PINGS
+    )
+
+
+async def list_access(interaction: discord.Interaction):
+    if not is_board(interaction):
+        return await interaction.response.send_message("❌ Tylko rola **Board** może to robić.", ephemeral=True)
+    rows = db.execute("SELECT user_id FROM permissions").fetchall()
+    text = "\n".join(f"• <@{r[0]}> (`{r[0]}`)" for r in rows) or "Brak dodatkowych osób (tylko rola Board)."
+    await interaction.response.send_message(text, ephemeral=True, allowed_mentions=NO_PINGS)
+
+
+# ----------------------------------------------------------------------------
+# TAPETA MIESIĄCA: TWORZENIE GŁOSOWANIA
+# ----------------------------------------------------------------------------
+REF_RE = re.compile(r"discord(?:app)?\.com/channels/\d+/(\d+)/(\d+)|\b(\d{17,20})\b")
+
+
+def parse_refs(text: str, default_channel_id: int) -> list[tuple[int, int]]:
+    """Wyciąga (channel_id, message_id) z linków i/lub samych ID."""
+    refs = []
+    for chan, msg, bare in REF_RE.findall(text):
+        if bare:
+            refs.append((default_channel_id, int(bare)))
+        else:
+            refs.append((int(chan), int(msg)))
+    return refs
+
+
+def parse_end(text: str) -> datetime:
+    text = text.strip()
+    for fmt, date_only in (("%d.%m.%Y %H:%M", False), ("%Y-%m-%d %H:%M", False), ("%d.%m.%Y", True)):
+        try:
+            dt = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if date_only:
+            dt = dt.replace(hour=23, minute=59)
+        dt = dt.replace(tzinfo=TZ)
+        if dt <= datetime.now(TZ):
+            raise UserError("Termin końca głosowania musi być w przyszłości.")
+        return dt
+    raise UserError("Zły format daty. Użyj np. `31.10.2026 20:00` (UTC) lub `31.10.2026`.")
+
+
+def resolve_channels(guild: discord.Guild, default_channel, default_source_id: int | None, text: str):
+    """Zwraca (kanał publikacji, ID kanału ze źródłowymi wiadomościami)."""
+    channel, source_id = default_channel, default_source_id
+    if text.strip():
+        try:
+            ids = [int(part) for part in text.split(",")]
+        except ValueError:
+            raise UserError("ID kanałów muszą być liczbami oddzielonymi przecinkiem.")
+        if len(ids) > 2:
+            raise UserError("Podaj najwyżej dwa ID kanałów oddzielone przecinkiem.")
+        channel = guild.get_channel_or_thread(ids[0])
+        if len(ids) == 2:
+            source = guild.get_channel_or_thread(ids[1])
+            if not isinstance(source, (discord.TextChannel, discord.Thread)):
+                raise UserError("Nie znaleziono kanału źródłowego na tym serwerze.")
+            source_id = source.id
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        raise UserError("Podaj ID kanału tekstowego tego serwera.")
+    if source_id is None:
+        source_id = channel.id
+    return channel, source_id
+
+async def load_entries(guild: discord.Guild, refs):
+    items = []
+    for cid, mid in refs:
+        ch = guild.get_channel_or_thread(cid)
+        if ch is None:
+            raise UserError(f"Nie widzę kanału dla wiadomości `{mid}`.")
+        try:
+            msg = await ch.fetch_message(mid)
+        except discord.NotFound:
+            raise UserError(f"Nie znaleziono wiadomości `{mid}` na kanale {ch.mention}.")
+        except discord.Forbidden:
+            raise UserError(f"Bot nie ma dostępu do kanału {ch.mention}.")
+        att = next(
+            (
+                a
+                for a in msg.attachments
+                if (a.content_type or "").startswith("image/")
+                or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+            ),
+            None,
+        )
+        if att is None:
+            raise UserError(
+                f"Wiadomość `{mid}` nie ma załączonego obrazka. "
+                "Screen musi być wgrany jako załącznik, a nie wklejony jako link."
+            )
+        items.append((msg, att))
+    return items
+
+
+async def create_poll(
+    guild: discord.Guild,
+    created_by: int,
+    entries_text: str,
+    end_text: str,
+    channels_text: str,
+    default_channel,
+    default_source_id: int | None,
+):
+    """Tworzy głosowanie (wspólne dla /tapeta i panelu CoreOPS). Zwraca (numer, kanał, koniec jako timestamp)."""
+    end_dt = parse_end(end_text)
+    channel, source_id = resolve_channels(guild, default_channel, default_source_id, channels_text)
+    refs = parse_refs(entries_text, source_id)
+    low, high = poll_limits()
+    if not (low <= len(refs) <= high):
+        raise UserError(f"Podaj od {low} do {high} wiadomości (wykryto: {len(refs)}).")
+    if len(set(refs)) != len(refs):
+        raise UserError("Na liście są duplikaty.")
+    items = await load_entries(guild, refs)
+
+    try:
+        # najpierw pobieramy wszystkie obrazki, żeby przy błędzie nic nie wysłać
+        prepared = []
+        for n, (msg, att) in enumerate(items, 1):
+            data = await att.read()
+            ext = Path(att.filename).suffix.lower() or ".png"
+            prepared.append((n, msg.author.id, f"tapeta_{n}{ext}", data))
+
+        end_ts = int(end_dt.timestamp())
+        header = discord.Embed(
+            title="📸 Tapeta miesiąca",
+            description=(
+                f"Zagłosuj reakcją {VOTE_EMOJI} pod swoją ulubioną tapetą.\n"
+                f"Głosowanie kończy się <t:{end_ts}:F> (<t:{end_ts}:R>)."
+            ),
+            color=EMBED_COLOR,
+        )
+        header.set_footer(text=ORG_NAME)
+        await channel.send(embed=header, allowed_mentions=NO_PINGS)
+
+        vote_ids = []
+        for n, author_id, fname, data in prepared:
+            file = discord.File(io.BytesIO(data), filename=fname)
+            emb = discord.Embed(description=f"Autor: <@{author_id}>", color=EMBED_COLOR)
+            emb.set_image(url=f"attachment://{fname}")
+            emb.set_footer(text=f"{ORG_NAME} • głosuj reakcją {VOTE_EMOJI}")
+            sent = await channel.send(embed=emb, file=file, allowed_mentions=NO_PINGS)
+            await sent.add_reaction(VOTE_EMOJI)
+            vote_ids.append((n, sent.id))
+    except discord.HTTPException as error:
+        log.exception("Błąd przy wysyłaniu głosowania")
+        raise UserError(
+            f"Błąd Discorda: {error}\nSprawdź, czy bot ma uprawnienia do wysyłania wiadomości, "
+            "osadzania linków, załączników i dodawania reakcji na tym kanale."
+        ) from error
+
+    cur = db.execute(
+        "INSERT INTO polls (guild_id, channel_id, end_ts, created_by) VALUES (?, ?, ?, ?)",
+        (guild.id, channel.id, end_ts, created_by),
+    )
+    poll_id = cur.lastrowid
+    db.executemany(
+        "INSERT INTO entries (poll_id, number, vote_message_id) VALUES (?, ?, ?)",
+        [(poll_id, n, mid) for n, mid in vote_ids],
+    )
+    db.commit()
+    return poll_id, channel, end_ts
+
+
+class WallpaperCreateModal(discord.ui.Modal, title="Nowe głosowanie na tapetę"):
+    entries = discord.ui.TextInput(
+        label="Linki do wiadomości ze screenami",
+        style=discord.TextStyle.paragraph,
+        placeholder="Wklej linki (lub ID) do wiadomości ze screenami, oddzielone enterem lub spacją",
+        max_length=3000,
+    )
+    end_input = discord.ui.TextInput(label="Koniec: DD.MM.RRRR HH:MM (UTC)", max_length=30)
+    channel_input = discord.ui.TextInput(
+        label="ID kanałów: publikacja, źródło (opcjonalnie)", required=False, max_length=45
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not feature_enabled("tapeta"):
+            return await interaction.response.send_message(f"⛔ {disabled_message()}", ephemeral=True)
+        if not is_allowed(interaction):
+            return await interaction.response.send_message("Nie masz uprawnień.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            poll_id, channel, end_ts = await create_poll(
+                interaction.guild,
+                interaction.user.id,
+                self.entries.value,
+                self.end_input.value,
+                self.channel_input.value,
+                interaction.channel,
+                interaction.channel_id,
+            )
+            await interaction.followup.send(
+                f"✅ Głosowanie **#{poll_id}** wystartowało na {channel.mention}. Koniec: <t:{end_ts}:F>.",
+                ephemeral=True,
+            )
+        except UserError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+        except discord.HTTPException as e:
+            log.exception("Błąd przy wysyłaniu głosowania")
+            await interaction.followup.send(
+                f"❌ Błąd Discorda: {e}\nSprawdź, czy bot ma uprawnienia do wysyłania wiadomości, "
+                "osadzania linków, załączników i dodawania reakcji na tym kanale.",
+                ephemeral=True,
+            )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("Błąd modala", exc_info=error)
+
+
+# ----------------------------------------------------------------------------
+# TAPETA MIESIĄCA: LISTA, ANULOWANIE, ZAKOŃCZENIE I WYNIKI
+# ----------------------------------------------------------------------------
+async def show_active_polls(interaction: discord.Interaction):
+    rows = db.execute(
+        "SELECT id, channel_id, end_ts FROM polls WHERE status='active' AND guild_id=? ORDER BY end_ts",
+        (interaction.guild_id,),
+    ).fetchall()
+    text = "\n".join(f"**#{i}** <#{c}>, koniec <t:{e}:F>" for i, c, e in rows) or "Brak aktywnych głosowań."
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+async def cancel_poll(interaction: discord.Interaction, poll_id: int):
+    cur = db.execute(
+        "UPDATE polls SET status='cancelled' WHERE id=? AND guild_id=? AND status='active'",
+        (poll_id, interaction.guild_id),
+    )
+    db.commit()
+    if cur.rowcount:
+        await interaction.response.send_message(f"✅ Głosowanie #{poll_id} anulowano.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Nie ma takiego aktywnego głosowania.", ephemeral=True)
+
+
+async def finish_poll(poll_id: int):
+    row = db.execute("SELECT channel_id FROM polls WHERE id=?", (poll_id,)).fetchone()
+    # oznaczamy od razu, żeby przy ewentualnym błędzie nie spamować wynikami co 30 s
+    db.execute("UPDATE polls SET status='done' WHERE id=?", (poll_id,))
+    db.commit()
+    if row is None:
+        return
+
+    channel = client.get_channel(row[0]) or await client.fetch_channel(row[0])
+    entry_rows = db.execute(
+        "SELECT number, vote_message_id FROM entries WHERE poll_id=? ORDER BY number", (poll_id,)
+    ).fetchall()
+
+    results = []
+    for number, vote_msg_id in entry_rows:
+        try:
+            msg = await channel.fetch_message(vote_msg_id)
+        except discord.NotFound:
+            continue
+        votes = sum(
+            max(r.count - (1 if r.me else 0), 0) for r in msg.reactions if str(r.emoji) == VOTE_EMOJI
+        )
+        emb = msg.embeds[0] if msg.embeds else None
+        if emb is None or emb.image is None:
+            continue
+        author = re.search(r"<@!?(\d+)>", emb.description or "")
+        results.append(
+            {
+                "number": number,
+                "votes": votes,
+                "image": emb.image.url,
+                "author_id": author.group(1) if author else None,
+            }
+        )
+
+    if not results:
+        await channel.send(
+            "Głosowanie zakończone, ale nie udało się odczytać żadnych zgłoszeń.", allowed_mentions=NO_PINGS
+        )
+        return
+
+    results.sort(key=lambda r: (-r["votes"], r["number"]))
+
+    embeds = []
+    place, prev_votes = 0, None
+    for idx, r in enumerate(results[:3], 1):
+        tie = prev_votes is not None and r["votes"] == prev_votes
+        if r["votes"] != prev_votes:
+            place, prev_votes = idx, r["votes"]
+        emb = discord.Embed(
+            title=f"{MEDALS[place]} {place}. miejsce",
+            description=(
+                (f"Autor: <@{r['author_id']}>\n" if r["author_id"] else "")
+                + f"Liczba głosów: **{r['votes']}**"
+                + (" (remis)" if tie else "")
+            ),
+            color=EMBED_COLOR,
+        )
+        emb.set_image(url=r["image"])
+        emb.set_footer(text=ORG_NAME)
+        embeds.append(emb)
+
+    await channel.send(
+        content="🏆 **Wyniki głosowania na tapetę miesiąca**", embeds=embeds, allowed_mentions=NO_PINGS
+    )
+
+
+@tasks.loop(seconds=30)
+async def check_polls():
+    rows = db.execute(
+        "SELECT id FROM polls WHERE status='active' AND end_ts<=?", (int(time.time()),)
+    ).fetchall()
+    for (poll_id,) in rows:
+        try:
+            await finish_poll(poll_id)
+        except Exception:
+            log.exception("Nie udało się zakończyć głosowania #%s", poll_id)
+
+
+@check_polls.before_loop
+async def _before_check_polls():
+    await client.wait_until_ready()
+
+
+# ----------------------------------------------------------------------------
+# TAPETA MIESIĄCA: MENU /tapeta
+# ----------------------------------------------------------------------------
+class WallpaperActionModal(discord.ui.Modal):
+    value = discord.ui.TextInput(label="ID głosowania lub użytkownika", max_length=100)
+
+    def __init__(self, action: str):
+        super().__init__(title="Tapeta: " + action)
+        self.action = action
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.action == "anuluj":
+            if not is_allowed(interaction):
+                return await interaction.response.send_message("Nie masz uprawnień.", ephemeral=True)
+            try:
+                poll_id = int(self.value.value)
+            except ValueError:
+                return await interaction.response.send_message("Podaj numer głosowania.", ephemeral=True)
+            await cancel_poll(interaction, poll_id)
+        elif self.action == "dodaj dostęp":
+            await grant_access(interaction, self.value.value)
+        else:
+            await revoke_access(interaction, self.value.value)
+
+
+class WallpaperMenu(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not feature_enabled("tapeta"):
+            await interaction.response.send_message(f"⛔ {disabled_message()}", ephemeral=True)
+            return False
+        if interaction.user.id != self.owner_id or not is_allowed(interaction):
+            await interaction.response.send_message("Nie masz dostępu do tego panelu.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(
+        placeholder="Wybierz, co chcesz zrobić",
+        options=[
+            discord.SelectOption(label="Utwórz głosowanie", value="start"),
+            discord.SelectOption(label="Aktywne głosowania", value="lista"),
+            discord.SelectOption(label="Anuluj głosowanie", value="anuluj"),
+            discord.SelectOption(label="Dodaj dostęp (Board)", value="dodaj dostęp"),
+            discord.SelectOption(label="Usuń dostęp (Board)", value="usuń dostęp"),
+            discord.SelectOption(label="Lista uprawnionych (Board)", value="dostęp"),
+        ],
+    )
+    async def choose(self, interaction: discord.Interaction, select: discord.ui.Select):
+        action = select.values[0]
+        if action in ("dodaj dostęp", "usuń dostęp", "dostęp") and not is_board(interaction):
+            return await interaction.response.send_message(
+                "Tylko rola Board może zarządzać dostępem.", ephemeral=True
+            )
+        if action == "start":
+            await interaction.response.send_modal(WallpaperCreateModal())
+        elif action == "lista":
+            await show_active_polls(interaction)
+        elif action == "dostęp":
+            await list_access(interaction)
+        else:
+            await interaction.response.send_modal(WallpaperActionModal(action))
+
+
+@tree.command(name="tapeta", description="Tapety: głosowania i zarządzanie dostępem")
+@app_commands.guild_only()
+async def tapeta(interaction: discord.Interaction):
+    if not is_allowed(interaction):
+        return await interaction.response.send_message("Nie masz uprawnień do tapet.", ephemeral=True)
+    await interaction.response.send_message(
+        "Wybierz działanie:", view=WallpaperMenu(interaction.user.id), ephemeral=True
+    )
+
+
+# ----------------------------------------------------------------------------
+# POGODA: /metar i /taf (aviationweather.gov)
+# ----------------------------------------------------------------------------
+FLIGHT_CATEGORY_COLORS = {"VFR": 0x2ECC71, "MVFR": 0x3498DB, "IFR": 0xE74C3C, "LIFR": 0xC2185B}
+# widzialność tuż po grupie wiatru w surowym METAR: metry albo CAVOK
+VISIBILITY_RE = re.compile(r"\b(?:\d{3}|VRB)\d{2,3}(?:G\d{2,3})?KT(?: \d{3}V\d{3})? (CAVOK|\d{4})\b")
+
+
+def parse_icao(text: str) -> str:
+    icao = text.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{4}", icao):
+        raise UserError("Podaj czteroliterowy kod ICAO, np. EPWA.")
+    return icao
+
+
+def format_wind(m: dict) -> str:
+    speed, gust, direction = m.get("wspd"), m.get("wgst"), m.get("wdir")
+    if not speed:
+        return "Cisza"
+    if direction == "VRB":
+        text = f"zmienny / {speed} kt"
+    elif isinstance(direction, (int, float)):
+        text = f"{int(direction):03d}° / {speed} kt"
+    else:
+        text = f"{speed} kt"
+    return text + (f"\nporywy {gust} kt" if gust else "")
+
+
+def format_visibility(m: dict) -> str:
+    match = VISIBILITY_RE.search(m.get("rawOb") or "")
+    if match:
+        if match.group(1) == "CAVOK":
+            return "CAVOK"
+        meters = int(match.group(1))
+    else:
+        visibility = m.get("visib")
+        if visibility is None:
+            return "—"
+        if isinstance(visibility, str) and visibility.endswith("+"):
+            return "10 km lub więcej"
+        try:
+            meters = round(float(visibility) * 1609.344, -2)  # API podaje mile lądowe
+        except (TypeError, ValueError):
+            return str(visibility)
+    if meters >= 9999:
+        return "10 km lub więcej"
+    if meters >= 1000:
+        return f"{meters / 1000:g} km"
+    return f"{int(meters)} m"
+
+
+def format_clouds(m: dict) -> str:
+    if "CAVOK" in (m.get("rawOb") or "").split():
+        return "CAVOK"
+    parts = []
+    for cloud in m.get("clouds") or []:
+        cover, base = cloud.get("cover"), cloud.get("base")
+        parts.append(f"{cover} {base:,} ft".replace(",", " ") if base is not None else str(cover))
+    return "\n".join(parts) or "—"
+
+
+def format_degrees(value) -> str:
+    return f"{value:g}°C" if isinstance(value, (int, float)) else "—"
+
+
+def build_metar_embed(m: dict, icao: str) -> discord.Embed:
+    category = m.get("fltCat")
+    embed = discord.Embed(
+        title=f"🌤️ METAR • {m.get('icaoId') or icao}",
+        color=FLIGHT_CATEGORY_COLORS.get(category, EMBED_COLOR),
+    )
+    description = f"**{m['name']}**" if m.get("name") else ""
+    if isinstance(m.get("obsTime"), (int, float)):
+        observed = datetime.fromtimestamp(m["obsTime"], TZ)
+        description += f"\nObserwacja: {observed:%H:%M}Z, {observed:%d.%m} • <t:{int(m['obsTime'])}:R>"
+    embed.description = description.strip() or None
+
+    altimeter = m.get("altim")
+    embed.add_field(name="💨 Wiatr", value=format_wind(m))
+    embed.add_field(name="👁️ Widzialność", value=format_visibility(m))
+    embed.add_field(name="☁️ Chmury", value=format_clouds(m))
+    embed.add_field(
+        name="🌡️ Temp. / punkt rosy",
+        value=f"{format_degrees(m.get('temp'))} / {format_degrees(m.get('dewp'))}",
+    )
+    embed.add_field(name="🔽 QNH", value=f"{round(altimeter)} hPa" if altimeter is not None else "—")
+    embed.add_field(name="✈️ Kategoria", value=category or "—")
+    if m.get("wxString"):
+        embed.add_field(name="🌧️ Zjawiska", value=f"`{m['wxString']}`", inline=False)
+    embed.add_field(name="Raport", value=f"```\n{m.get('rawOb', '—')}\n```", inline=False)
+    embed.set_footer(text="Źródło: aviationweather.gov • czasy w UTC")
+    return embed
+
+
+def format_taf(raw: str) -> str:
+    """Rozbija TAF na linie: każdy BECMG / TEMPO / FM / PROBxx zaczyna nowy wiersz."""
+    text = re.sub(r"\s+(?=(?:BECMG|TEMPO|FM\d{6}|PROB\d{2})\b)", "\n  ", raw.strip())
+    return re.sub(r"(PROB\d{2})\n\s+(TEMPO)", r"\1 \2", text)
+
+
+def build_taf_embed(t: dict, icao: str) -> discord.Embed:
+    lines = []
+    if t.get("name"):
+        lines.append(f"**{t['name']}**")
+    if isinstance(t.get("validTimeFrom"), (int, float)) and isinstance(t.get("validTimeTo"), (int, float)):
+        start, end = datetime.fromtimestamp(t["validTimeFrom"], TZ), datetime.fromtimestamp(t["validTimeTo"], TZ)
+        lines.append(f"Ważny: {start:%d.%m %H:%M}Z → {end:%d.%m %H:%M}Z")
+    raw = format_taf(t.get("rawTAF") or "")
+    embed = discord.Embed(
+        title=f"🌦️ TAF • {t.get('icaoId') or icao}",
+        description=("\n".join(lines) + "\n" if lines else "") + f"```\n{raw[:3500]}\n```",
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text="Źródło: aviationweather.gov • czasy w UTC")
+    return embed
+
+
+async def send_weather(interaction: discord.Interaction, icao: str, product: str):
+    try:
+        station = parse_icao(icao)
+    except UserError as error:
+        return await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+    await interaction.response.defer()
+    try:
+        data = await fetch(f"{WEATHER_API}/{product}", {"ids": station, "format": "json"})
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            raise UserError(
+                f"Brak aktualnego {product.upper()} dla **{station}**. "
+                "To lotnisko może nie nadawać tego raportu - spróbuj innej stacji."
+            )
+        builder = build_metar_embed if product == "metar" else build_taf_embed
+        embed = builder(data[0], station)
+    except UserError as error:
+        return await interaction.followup.send(f"❌ {error}")
+    await interaction.followup.send(embed=embed, allowed_mentions=NO_PINGS)
+
+
+@tree.command(name="metar", description="Aktualny METAR z aviationweather.gov")
+@app_commands.describe(icao="Kod ICAO lotniska, np. EPWA")
+async def metar(interaction: discord.Interaction, icao: str):
+    await send_weather(interaction, icao, "metar")
+
+
+@tree.command(name="taf", description="Aktualny TAF z aviationweather.gov")
+@app_commands.describe(icao="Kod ICAO lotniska, np. EPKK")
+async def taf(interaction: discord.Interaction, icao: str):
+    await send_weather(interaction, icao, "taf")
+
+
+# ----------------------------------------------------------------------------
+# REZERWACJE ATC: /bookings (atc-bookings.vatsim.net)
+# ----------------------------------------------------------------------------
+# typ rezerwacji z API -> (znacznik, nazwa w legendzie); kolejność = kolejność legendy
+BOOKING_TYPES = {
+    "training": ("🔹", "Training session"),
+    "exam": ("🔸", "Exam"),
+    "booking": ("🟢", "Booking"),
+    "event": ("🟣", "Event"),
+}
+BOOKING_FILTERS = {
+    "all": None,
+    "sessions": {"training", "exam"},
+    "booking": {"booking"},
+    "event": {"event"},
+}
+BOOKING_FIELDS_PER_EMBED = 24  # limit Discorda to 25 pól; 24 daje pełne rzędy po 3
+
+
+def booking_time(value) -> datetime:
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, TZ)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed.replace(tzinfo=TZ) if parsed.tzinfo is None else parsed.astimezone(TZ)
+
+
+def parse_day(text: str | None) -> datetime:
+    if not text:
+        return datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text.strip(), fmt).replace(tzinfo=TZ)
+        except ValueError:
+            pass
+    raise UserError("Podaj datę DD.MM.RRRR lub RRRR-MM-DD.")
+
+
+async def load_polish_bookings(day: datetime) -> list[dict]:
+    """Rezerwacje z callsignami EP, które trwają w którejkolwiek chwili danego dnia (UTC).
+
+    API filtruje po dacie rozpoczęcia, więc pobieramy też dzień poprzedni - tak łapiemy sesje
+    przechodzące przez północ.
+    """
+    day_end = day + timedelta(days=1)
+    found = {}
+    for offset in (-1, 0):
+        date = (day + timedelta(days=offset)).strftime("%Y-%m-%d")
+        payload = await fetch(BOOKINGS_API, {"date": date}, ttl=120)
+        if not isinstance(payload, list):
+            raise UserError("API rezerwacji zwróciło nieoczekiwany format danych.")
+        for item in payload:
+            try:
+                callsign = str(item["callsign"]).upper()
+                if not callsign.startswith(booking_prefixes()):
+                    continue
+                booking = {
+                    "callsign": callsign,
+                    "cid": item.get("cid"),
+                    "type": str(item.get("type") or "booking").lower(),
+                    "begins": booking_time(item["start"]),
+                    "ends": booking_time(item["end"]),
+                }
+            except (KeyError, TypeError, ValueError, OverflowError):
+                log.warning("Pominięto niepoprawną rezerwację: %r", item)
+                continue
+            if booking["begins"] < day_end and booking["ends"] > day:
+                key = item.get("id", (callsign, booking["begins"]))
+                found[key] = booking
+    return sorted(found.values(), key=lambda b: (b["begins"], b["callsign"]))
+
+
+def booking_marker(kind: str) -> str:
+    return BOOKING_TYPES.get(kind, ("🔘", ""))[0]
+
+
+def booking_hours(b: dict, day: datetime) -> str:
+    def clock(moment: datetime) -> str:
+        # godzina; z datą tylko wtedy, gdy koniec/początek wypada poza oglądanym dniem
+        return f"{moment:%H:%M}" if moment.date() == day.date() else f"{moment:%Y-%m-%d %H:%M}"
+
+    return f"{clock(b['begins'])} - {clock(b['ends'])} UTC"
+
+
+def build_booking_embeds(day: datetime, rows: list[dict]) -> list[discord.Embed]:
+    """Embedy w układzie: opis z legendą typów + pola po 3 w rzędzie (callsign, CID, godziny)."""
+    kinds = [k for k in BOOKING_TYPES if any(b["type"] == k for b in rows)]
+    kinds += sorted({b["type"] for b in rows} - set(BOOKING_TYPES))
+    description = f"Showing {len(rows)} {'booking' if len(rows) == 1 else 'bookings'} for date `{day:%Y-%m-%d}`."
+    if kinds:
+        legend = "\n".join(
+            f"{booking_marker(k)} {BOOKING_TYPES[k][1] if k in BOOKING_TYPES else k.capitalize()}" for k in kinds
+        )
+        description += f"\nSession types:\n{legend}"
+
+    now = datetime.now(TZ)
+    chunks = [rows[i : i + BOOKING_FIELDS_PER_EMBED] for i in range(0, len(rows), BOOKING_FIELDS_PER_EMBED)]
+    embeds = []
+    for number, chunk in enumerate(chunks or [[]]):
+        embed = discord.Embed(description=description if number == 0 else None, color=EMBED_COLOR, timestamp=now)
+        for b in chunk:
+            callsign = re.sub(r"[^A-Z0-9_]", "", b["callsign"])
+            cid = str(b["cid"] or "")
+            who = f"CID {cid}" if cid.isdigit() else "CID unknown"
+            embed.add_field(
+                name=f"{booking_marker(b['type'])} {callsign}",
+                value=f"**{who}**\n{booking_hours(b, day)}",
+            )
+        embeds.append(embed)
+    return embeds
+
+
+@tree.command(name="bookings", description="Rezerwacje ATC w Polsce (callsigny EP)")
+@app_commands.describe(
+    data="DD.MM.RRRR lub RRRR-MM-DD; domyślnie dzisiaj. Dzień według UTC.",
+    typ="Które rezerwacje pokazać; domyślnie wszystkie.",
+)
+@app_commands.choices(
+    typ=[
+        app_commands.Choice(name="Wszystkie", value="all"),
+        app_commands.Choice(name="Treningi i egzaminy", value="sessions"),
+        app_commands.Choice(name="Zwykłe rezerwacje", value="booking"),
+        app_commands.Choice(name="Eventy", value="event"),
+    ]
+)
+async def bookings(
+    interaction: discord.Interaction, data: str | None = None, typ: app_commands.Choice[str] | None = None
+):
+    try:
+        day = parse_day(data)
+    except UserError as error:
+        return await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+    await interaction.response.defer()
+    try:
+        rows = await load_polish_bookings(day)
+    except UserError as error:
+        return await interaction.followup.send(f"❌ {error}")
+
+    allowed_types = BOOKING_FILTERS.get(typ.value if typ else str(panel_settings.get("bookings_default_type") or "all"))
+    if allowed_types is not None:
+        rows = [b for b in rows if b["type"] in allowed_types]
+
+    for embed in build_booking_embeds(day, rows):
+        await interaction.followup.send(embed=embed, allowed_mentions=NO_PINGS)
+
+
+# ----------------------------------------------------------------------------
+# ROLE PILOTÓW: /rola
+# ----------------------------------------------------------------------------
+@tree.command(name="rola", description="Nadaj sobie rolę Training Pilot lub Exam Pilot (albo ją usuń)")
+@app_commands.guild_only()
+@app_commands.describe(pilot="Którą rolę chcesz dostać", akcja="Domyślnie: Dodaj")
+@app_commands.choices(
+    pilot=[
+        app_commands.Choice(name="Training Pilot", value="training"),
+        app_commands.Choice(name="Exam Pilot", value="exam"),
+    ],
+    akcja=[app_commands.Choice(name="Dodaj", value="add"), app_commands.Choice(name="Usuń", value="remove")],
+)
+async def rola(
+    interaction: discord.Interaction,
+    pilot: app_commands.Choice[str],
+    akcja: app_commands.Choice[str] | None = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    selected = interaction.guild.get_role(pilot_role_id(pilot.value))
+    member = interaction.user
+    bot_member = interaction.guild.me
+    if selected is None:
+        return await interaction.followup.send("Nie znaleziono roli. Sprawdź skonfigurowane ID.", ephemeral=True)
+    if (
+        not bot_member
+        or not bot_member.guild_permissions.manage_roles
+        or selected >= bot_member.top_role
+        or selected.managed
+    ):
+        return await interaction.followup.send(
+            "Bot potrzebuje uprawnienia Zarządzanie rolami, a jego rola musi być ponad wybraną rolą pilota.",
+            ephemeral=True,
+        )
+    remove = akcja is not None and akcja.value == "remove"
+    has_role = selected in member.roles
+    if remove and not has_role:
+        return await interaction.followup.send(f"Nie masz roli **{selected.name}**.", ephemeral=True)
+    if not remove and has_role:
+        return await interaction.followup.send(f"Masz już rolę **{selected.name}**.", ephemeral=True)
+    try:
+        if remove:
+            await member.remove_roles(selected, reason="Samodzielny wybór /rola")
+        else:
+            await member.add_roles(selected, reason="Samodzielny wybór /rola")
+        await interaction.followup.send(
+            f"✅ {'Usunięto' if remove else 'Dodano'} rolę **{selected.name}**.",
+            ephemeral=True,
+            allowed_mentions=NO_PINGS,
+        )
+    except discord.HTTPException:
+        log.exception("Nie udało się zmienić roli %s", selected.id)
+        await interaction.followup.send(
+            "Nie udało się zmienić roli. Sprawdź uprawnienia bota i spróbuj ponownie.", ephemeral=True
+        )
+
+
+# ----------------------------------------------------------------------------
+# PANEL COREOPS: ustawienia, stan i polecenia (co SYNC_SECONDS)
+# ----------------------------------------------------------------------------
+pending_results: list[dict] = []  # wyniki poleceń do odesłania przy następnej wymianie
+
+
+async def sync_commands() -> None:
+    if GUILD_ID:
+        guild = discord.Object(int(GUILD_ID))
+        tree.copy_global_to(guild=guild)
+        await tree.sync(guild=guild)
+    else:
+        await tree.sync()
+
+
+def get_guild() -> discord.Guild | None:
+    if GUILD_ID.isdigit():
+        return client.get_guild(int(GUILD_ID))
+    return client.guilds[0] if len(client.guilds) == 1 else None
+
+
+def role_status(guild: discord.Guild | None, role_id: int) -> dict:
+    role = guild.get_role(role_id) if guild else None
+    me = guild.me if guild else None
+    ok = bool(role and me and me.guild_permissions.manage_roles and role < me.top_role and not role.managed)
+    return {"id": str(role_id), "name": role.name if role else None, "ok": ok}
+
+
+def build_report() -> dict:
+    guild = get_guild()
+    latency = client.latency
+    polls = [
+        {"id": r[0], "channel_id": str(r[1]), "end_ts": r[2], "status": r[3], "entries": r[4]}
+        for r in db.execute(
+            "SELECT p.id, p.channel_id, p.end_ts, p.status, "
+            "(SELECT COUNT(*) FROM entries e WHERE e.poll_id = p.id) "
+            "FROM polls p ORDER BY (p.status = 'active') DESC, p.end_ts DESC LIMIT 20"
+        )
+    ]
+    access = []
+    for (uid,) in db.execute("SELECT user_id FROM permissions ORDER BY user_id"):
+        user = client.get_user(uid)
+        access.append({"user_id": str(uid), "name": str(user) if user else ""})
+    return {
+        "bot": {
+            "name": str(client.user) if client.user else "",
+            "version": VERSION,
+            "started_at": STARTED_AT,
+            "latency_ms": None if latency is None or math.isnan(latency) else round(latency * 1000),
+            "guild": {"name": guild.name, "members": guild.member_count} if guild else None,
+        },
+        "polls": polls,
+        "access": access,
+        "roles": {kind: role_status(guild, pilot_role_id(kind)) for kind in PILOT_ROLES},
+        "applied_rev": panel_rev,
+        "results": list(pending_results),
+    }
+
+
+async def run_action(action: dict) -> tuple[bool, str]:
+    """Wykonuje polecenie z panelu. Zwraca (powodzenie, komunikat pokazywany w panelu)."""
+    kind = str(action.get("type") or "")
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    if kind == "resync":
+        await sync_commands()
+        return True, "Slash commands re-registered."
+    if kind == "poll_create":
+        guild = get_guild()
+        if guild is None:
+            return False, "The bot cannot find the server (check GUILD_ID)."
+        poll_id, channel, _ = await create_poll(
+            guild,
+            0,  # 0 = utworzone z panelu
+            str(payload.get("entries", "")),
+            str(payload.get("end", "")),
+            str(payload.get("channels", "")),
+            None,
+            None,
+        )
+        return True, f"Poll #{poll_id} started in #{channel.name}."
+    if kind in ("poll_cancel", "poll_finish"):
+        try:
+            poll_id = int(payload.get("poll_id", 0))
+        except (TypeError, ValueError):
+            return False, "Wrong poll number."
+        row = db.execute("SELECT 1 FROM polls WHERE id=? AND status='active'", (poll_id,)).fetchone()
+        if row is None:
+            return False, f"There is no active poll #{poll_id}."
+        if kind == "poll_cancel":
+            db.execute("UPDATE polls SET status='cancelled' WHERE id=? AND status='active'", (poll_id,))
+            db.commit()
+            return True, f"Poll #{poll_id} cancelled."
+        await finish_poll(poll_id)
+        return True, f"Poll #{poll_id} finished, results posted."
+    if kind in ("access_grant", "access_revoke"):
+        uid = str(payload.get("user_id", ""))
+        if not re.fullmatch(r"\d{17,20}", uid):
+            return False, "Wrong user ID."
+        if kind == "access_grant":
+            db.execute("INSERT OR REPLACE INTO permissions (user_id, added_by) VALUES (?, 0)", (int(uid),))
+        else:
+            db.execute("DELETE FROM permissions WHERE user_id=?", (int(uid),))
+        db.commit()
+        return True, f"Poll access {'granted to' if kind == 'access_grant' else 'removed from'} {uid}."
+    return False, "Unknown command."
+
+
+async def coreops_request(report: dict) -> dict | None:
+    try:
+        async with client.web.post(
+            f"{COREOPS_URL}/api/bot.php", json=report, headers={"Authorization": f"Bearer {COREOPS_TOKEN}"}
+        ) as response:
+            if response.status != 200:
+                log.warning("CoreOPS odpowiedział kodem %s", response.status)
+                return None
+            data = await response.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+        log.warning("Brak połączenia z CoreOPS: %s: %s", type(error).__name__, error)
+        return None
+    return data if isinstance(data, dict) and data.get("ok") else None
+
+
+async def sync_with_coreops() -> int:
+    """Jedna wymiana z panelem. Zwraca liczbę wykonanych poleceń."""
+    report = build_report()
+    sent = len(report["results"])
+    data = await coreops_request(report)
+    if data is None:
+        return 0
+    del pending_results[:sent]
+    config = data.get("config")
+    if isinstance(config, dict):
+        apply_panel_config(config)
+        try:
+            CONFIG_CACHE.write_text(json.dumps(config), encoding="utf-8")
+        except OSError:
+            log.warning("Nie można zapisać %s", CONFIG_CACHE)
+    done = 0
+    for action in data.get("actions") or []:
+        if not isinstance(action, dict) or not action.get("id"):
+            continue
+        try:
+            ok, message = await run_action(action)
+        except UserError as error:
+            ok, message = False, str(error)
+        except Exception as error:  # jedno złe polecenie nie może zatrzymać synchronizacji
+            log.exception("Polecenie z panelu (%s) nie powiodło się", action.get("type"))
+            ok, message = False, f"Bot error: {type(error).__name__}"
+        pending_results.append({"id": str(action["id"]), "ok": ok, "message": message[:280]})
+        done += 1
+    return done
+
+
+@tasks.loop(seconds=SYNC_SECONDS)
+async def coreops_sync():
+    if not (COREOPS_URL and COREOPS_TOKEN):
+        return
+    try:
+        if await sync_with_coreops():
+            await sync_with_coreops()  # od razu odeślij wyniki, panel nie musi czekać kolejnych 15 s
+    except Exception:
+        log.exception("Synchronizacja z CoreOPS nie powiodła się")
+
+
+@coreops_sync.before_loop
+async def _before_coreops_sync():
+    await client.wait_until_ready()
+
+
+# ----------------------------------------------------------------------------
+# OBSŁUGA BŁĘDÓW I START
+# ----------------------------------------------------------------------------
+@tree.error
+async def command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        message = f"Spróbuj ponownie za {error.retry_after:.0f} s."
+    else:
+        log.error("Komenda zakończyła się błędem", exc_info=error)
+        message = "Nie udało się wykonać komendy. Sprawdź log bota."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("Ustaw DISCORD_TOKEN w pliku .env obok bot.py.")
+    if COREOPS_URL and not COREOPS_TOKEN:
+        log.warning("COREOPS_URL jest ustawiony, ale brakuje COREOPS_TOKEN - panel CoreOPS nie będzie działał.")
+    if COREOPS_URL.startswith("http://") and not re.match(r"http://(localhost|127\.0\.0\.1)(:\d+)?(/|$)", COREOPS_URL):
+        log.warning("COREOPS_URL używa http - token API przechodzi przez sieć jawnym tekstem. Użyj https.")
+    client.run(TOKEN)

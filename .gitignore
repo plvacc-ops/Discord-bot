@@ -1,0 +1,7 @@
+# Sekrety i dane lokalne - nigdy do repozytorium
+.env
+*.db
+coreops_config.json
+__pycache__/
+*.pyc
+.venv/
