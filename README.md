@@ -28,6 +28,27 @@ Bot jest sterowany z portalu CoreOPS: **Configuration → Discord bot** (włącz
 W Discord Developer Portal włącz **Message Content Intent**. Bot potrzebuje na serwerze: wysyłanie wiadomości, osadzanie linków,
 załączniki, dodawanie reakcji i (dla `/rola`) Zarządzanie rolami - jego rola musi być ponad rolami Training/Exam Pilot.
 
+## Funkcje
+
+| Komenda | Co robi |
+| --- | --- |
+| `/tapeta` | głosowania na tapetę miesiąca; po wynikach bot **usuwa wiadomości z głosowania** (zwycięskie obrazy są ponownie wgrywane w wynikach) |
+| `/metar`, `/taf` | pogoda z aviationweather.gov |
+| `/bookings` | rezerwacje ATC z **API Core VACC** (przez CoreOPS - token Core VACC zostaje w CoreOPS) |
+| `/rola` | role Training Pilot / Exam Pilot |
+| `/mod warn / mute / unmute / timeout / kick / ban / unban / history` | moderacja: kara, wiadomość prywatna do ukaranego, sprawa w logu CoreOPS |
+| własne komendy ról | definiowane w CoreOPS (Configuration → Discord bot → Role commands) |
+
+**Moderacja.** Komendy `/mod` są dla roli Board, roli moderatora (ustawiana w CoreOPS) i administratorów. Każda kara dostaje numer sprawy,
+trafia do **CoreOPS → Configuration → Bot moderation** (z możliwością dodania zrzutów ekranu) i jest wysyłana ukaranemu w wiadomości prywatnej.
+Wyciszenie (`mute`) korzysta z roli Muted (ID w ustawieniach CoreOPS; rola musi blokować pisanie i mówienie na kanałach), a `timeout` to wbudowana
+przerwa Discorda (do 28 dni). Wyciszenia i bany czasowe zdejmują się same. Uprawnienia bota: Zarządzanie rolami, Wyrzucanie członków, Banowanie członków,
+Moderowanie członków; rola bota musi być **wyżej** niż role osób, które ma karać, i niż rola Muted.
+
+**Własne komendy ról.** W CoreOPS definiujesz nazwę komendy, opis, rolę i tryb (przełącz / tylko dodaj / tylko usuń), opcjonalnie rolę wymaganą do użycia.
+Bot sam rejestruje je w Discordzie po zapisaniu. Role z uprawnieniami administracyjnymi (administrator, zarządzanie serwerem/rolami/kanałami/wiadomościami,
+kick, ban, timeout...) nigdy nie są nadawane komendą.
+
 ## Połączenie z CoreOPS
 
 Bot **sam łączy się** z CoreOPS (co 15 s, `POST /api/bot.php`, nagłówek `Authorization: Bearer <token>`): wysyła stan (czy działa,
