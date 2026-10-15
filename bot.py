@@ -229,6 +229,20 @@ db.commit()
 # ----------------------------------------------------------------------------
 # CLIENT
 # ----------------------------------------------------------------------------
+# View Channels, Send Messages, Embed Links, Attach Files, Add Reactions, Read Message History, Manage Roles, Kick, Ban, Moderate Members
+INVITE_PERMISSIONS = 1099780181062
+
+
+def invite_url() -> str:
+    """Link that adds the bot to a server with the scopes and permissions it needs ('bot' AND 'applications.commands')."""
+    if client.user is None:
+        return ""
+    return (
+        f"https://discord.com/oauth2/authorize?client_id={client.user.id}"
+        f"&permissions={INVITE_PERMISSIONS}&scope=bot%20applications.commands"
+    )
+
+
 class PlvaccBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -260,6 +274,11 @@ class PlvaccBot(discord.Client):
             len(self.guilds),
             ", ".join(f"{g.name} ({g.id})" for g in self.guilds) or "none",
         )
+        if not self.guilds:
+            log.warning(
+                "The bot is not on any server - it was probably added without the 'bot' scope. Invite it with: %s",
+                invite_url(),
+            )
         guild = get_guild()
         log.info(
             "Server used for panel actions and timers: %s (GUILD_ID from .env: %s)",
@@ -1846,6 +1865,7 @@ def build_report() -> dict:
             "guild": {"name": guild.name, "members": guild.member_count} if guild else None,
             "guilds": [{"id": str(g.id), "name": g.name} for g in client.guilds[:25]],  # to pick the Server ID from
             "commands_error": commands_error,
+            "invite_url": invite_url(),
         },
         "polls": polls,
         "access": access,
