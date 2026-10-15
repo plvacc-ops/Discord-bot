@@ -1199,7 +1199,7 @@ def mod_embed(guild: discord.Guild, action: str, case_id: int, reason: str, expi
     appeal = str(panel_settings.get("mod_appeal_text") or "").strip()
     if appeal and action not in ("unmute", "unban"):
         embed.add_field(name="Appeal", value=appeal[:500], inline=False)
-    embed.set_footer(text=f"{ORG_NAME} • case #{case_id}")
+    embed.set_footer(text=f"{ORG_NAME} • #{case_id}")
     return embed
 
 
