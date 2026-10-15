@@ -1290,6 +1290,52 @@ async def send_mod_dm(user_id: int, embed: discord.Embed) -> str:
         return "failed"
 
 
+modlog_error = ""  # why the last message to the moderation log channel failed (empty = fine)
+
+
+async def post_mod_log(
+    guild: discord.Guild,
+    case_id: int,
+    action: str,
+    target_id: int,
+    target_name: str,
+    moderator: str,
+    reason: str,
+    expires_ts: int | None,
+    dm: str,
+    source: str,
+) -> None:
+    """Posts a message about the action in the moderation log channel chosen in CoreOPS (nothing when none is set)."""
+    global modlog_error
+    channel_id = setting_id("mod_log_channel_id", 0)
+    if not channel_id:
+        return
+    try:
+        channel = guild.get_channel_or_thread(channel_id) or await client.fetch_channel(channel_id)
+        emoji, title = MOD_ACTIONS[action]
+        embed = discord.Embed(title=f"{emoji} {title} - case #{case_id}", color=EMBED_COLOR, timestamp=datetime.now(TZ))
+        embed.add_field(name="User", value=f"<@{target_id}> `{target_id}`", inline=False)
+        embed.add_field(name="Moderator", value=(moderator or "-")[:100], inline=True)
+        embed.add_field(
+            name="Source",
+            value={"discord": "Discord command", "panel": "CoreOPS panel", "auto": "Automatic"}.get(source, source),
+            inline=True,
+        )
+        embed.add_field(name="Private message", value={"sent": "delivered", "failed": "not delivered"}.get(dm, "-"), inline=True)
+        if reason:
+            embed.add_field(name="Reason", value=reason[:1000], inline=False)
+        if expires_ts:
+            embed.add_field(name="In effect until", value=f"<t:{expires_ts}:F> (<t:{expires_ts}:R>)", inline=False)
+        elif action in ("mute", "ban"):
+            embed.add_field(name="Duration", value="permanent", inline=False)
+        embed.set_footer(text=ORG_NAME)
+        await channel.send(embed=embed, allowed_mentions=NO_PINGS)
+        modlog_error = ""
+    except (discord.HTTPException, AttributeError) as error:
+        modlog_error = f"{type(error).__name__}: {error}"[:200]
+        log.warning("Could not post to the moderation log channel %s: %s", channel_id, modlog_error)
+
+
 def drop_case(case_id: int) -> None:
     db.execute("DELETE FROM mod_cases WHERE id=?", (case_id,))
     db.commit()
@@ -1415,6 +1461,7 @@ async def apply_moderation(
         (dm, 1 if action in ("mute", "ban") else 0, case_id),
     )
     db.commit()
+    await post_mod_log(guild, case_id, action, target_id, target_name, mod_name, reason, expires_ts, dm, source)
     return case_id, dm, target_name
 
 
@@ -1577,13 +1624,20 @@ async def check_mod_expiry():
             log.exception("Could not remove the penalty (case #%s), will retry", case_id)
             continue
         db.execute("UPDATE mod_cases SET active=0 WHERE id=?", (case_id,))
+        auto_case = None
         if undo:
-            db.execute(
+            cur = db.execute(
                 "INSERT INTO mod_cases (ts, action, target_id, mod_name, reason, source, guild_id, reported) "
                 "VALUES (?, ?, ?, 'Automatic', ?, 'auto', ?, 0)",
                 (int(time.time()), undo, target_id, f"The penalty of case #{case_id} has expired", guild.id),
             )
+            auto_case = cur.lastrowid
         db.commit()
+        if auto_case:
+            await post_mod_log(
+                guild, auto_case, undo, target_id, str(target_id), "Automatic",
+                f"The penalty of case #{case_id} has expired", None, "n/a", "auto",
+            )
 
 
 @check_mod_expiry.before_loop
@@ -1838,6 +1892,9 @@ def effective_roles() -> dict:
             "name": ", ".join(r.name for r in roles if r) or None,
             "missing": [str(i) for i, r in zip(role_ids, roles) if r is None],
         }
+    channel_id = setting_id("mod_log_channel_id", 0)
+    channel = guild.get_channel_or_thread(channel_id) if guild and channel_id else None
+    out["modlog"] = {"id": str(channel_id) if channel_id else "", "name": f"#{channel.name}" if channel else None, "missing": []}
     return out
 
 
@@ -1865,6 +1922,7 @@ def build_report() -> dict:
             "guild": {"name": guild.name, "members": guild.member_count} if guild else None,
             "guilds": [{"id": str(g.id), "name": g.name} for g in client.guilds[:25]],  # to pick the Server ID from
             "commands_error": commands_error,
+            "modlog_error": modlog_error,
             "invite_url": invite_url(),
         },
         "polls": polls,
