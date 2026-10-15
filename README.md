@@ -1,6 +1,6 @@
 # Bot Discord Polish VACC
 
-Funkcje: `/tapeta` (głosowania na tapetę miesiąca), `/metar`, `/taf`, `/bookings`, `/rola`.
+Funkcje: `/wallpaper` (głosowania na tapetę miesiąca), `/metar`, `/taf`, `/bookings`, `/role`.
 Bot jest sterowany z portalu CoreOPS: **Configuration → Discord bot** (włączanie funkcji, ustawienia, głosowania, lista uprawnionych, status).
 
 > Bot to stale działający proces Pythona. Nie uruchamia się go na hostingu WWW ani w GitHub Actions - tylko na hostingu botów
@@ -26,16 +26,16 @@ Bot jest sterowany z portalu CoreOPS: **Configuration → Discord bot** (włącz
 5. Uruchom serwer. W CoreOPS (Configuration → Discord bot) status zmieni się na **online** w ciągu kilkunastu sekund.
 
 W Discord Developer Portal włącz **Message Content Intent**. Bot potrzebuje na serwerze: wysyłanie wiadomości, osadzanie linków,
-załączniki, dodawanie reakcji i (dla `/rola`) Zarządzanie rolami - jego rola musi być ponad rolami Training/Exam Pilot.
+załączniki, dodawanie reakcji i (dla `/role`) Zarządzanie rolami - jego rola musi być ponad rolami Training/Exam Pilot.
 
 ## Funkcje
 
 | Komenda | Co robi |
 | --- | --- |
-| `/tapeta` | głosowania na tapetę miesiąca; po wynikach bot **usuwa wiadomości z głosowania** (zwycięskie obrazy są ponownie wgrywane w wynikach) |
+| `/wallpaper` | głosowania na tapetę miesiąca; po wynikach bot **usuwa wiadomości z głosowania** (zwycięskie obrazy są ponownie wgrywane w wynikach) |
 | `/metar`, `/taf` | pogoda z aviationweather.gov |
 | `/bookings` | rezerwacje ATC z **API Core VACC** (przez CoreOPS - token Core VACC zostaje w CoreOPS) |
-| `/rola` | role Training Pilot / Exam Pilot |
+| `/role` | role Training Pilot / Exam Pilot |
 | `/mod warn / mute / unmute / timeout / kick / ban / unban / history` | moderacja: kara, wiadomość prywatna do ukaranego, sprawa w logu CoreOPS |
 | własne komendy ról | definiowane w CoreOPS (Configuration → Discord bot → Role commands) |
 

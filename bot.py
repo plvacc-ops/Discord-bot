@@ -60,7 +60,8 @@ log = logging.getLogger("plvacc-bot")
 # ----------------------------------------------------------------------------
 # USTAWIENIA Z PANELU COREOPS (puste = domyślne: wszystko włączone, wartości z .env)
 # ----------------------------------------------------------------------------
-COMMAND_FEATURES = {"tapeta": "tapeta", "metar": "metar", "taf": "taf", "bookings": "bookings", "rola": "rola", "mod": "moderation"}
+# nazwa komendy slash -> klucz funkcji w panelu CoreOPS (klucze zostają stare, żeby nie zgubić zapisanych ustawień)
+COMMAND_FEATURES = {"wallpaper": "tapeta", "metar": "metar", "taf": "taf", "bookings": "bookings", "role": "rola", "mod": "moderation"}
 panel_features: dict[str, bool] = {}
 panel_settings: dict = {}
 panel_rev = ""
@@ -435,7 +436,7 @@ async def create_poll(
     default_channel,
     default_source_id: int | None,
 ):
-    """Tworzy głosowanie (wspólne dla /tapeta i panelu CoreOPS). Zwraca (numer, kanał, koniec jako timestamp)."""
+    """Tworzy głosowanie (wspólne dla /wallpaper i panelu CoreOPS). Zwraca (numer, kanał, koniec jako timestamp)."""
     end_dt = parse_end(end_text)
     channel, source_id = resolve_channels(guild, default_channel, default_source_id, channels_text)
     refs = parse_refs(entries_text, source_id)
@@ -703,7 +704,7 @@ async def _before_check_polls():
 
 
 # ----------------------------------------------------------------------------
-# TAPETA MIESIĄCA: MENU /tapeta
+# TAPETA MIESIĄCA: MENU /wallpaper
 # ----------------------------------------------------------------------------
 class WallpaperActionModal(discord.ui.Modal):
     value = discord.ui.TextInput(label="ID głosowania lub użytkownika", max_length=100)
@@ -768,9 +769,9 @@ class WallpaperMenu(discord.ui.View):
             await interaction.response.send_modal(WallpaperActionModal(action))
 
 
-@tree.command(name="tapeta", description="Tapety: głosowania i zarządzanie dostępem")
+@tree.command(name="wallpaper", description="Wallpaper of the month: polls and access management")
 @app_commands.guild_only()
-async def tapeta(interaction: discord.Interaction):
+async def wallpaper(interaction: discord.Interaction):
     if not is_allowed(interaction):
         return await interaction.response.send_message("Nie masz uprawnień do tapet.", ephemeral=True)
     await interaction.response.send_message(
@@ -1074,22 +1075,22 @@ async def bookings(
 
 
 # ----------------------------------------------------------------------------
-# ROLE PILOTÓW: /rola
+# ROLE PILOTÓW: /role
 # ----------------------------------------------------------------------------
-@tree.command(name="rola", description="Nadaj sobie rolę Training Pilot lub Exam Pilot (albo ją usuń)")
+@tree.command(name="role", description="Give yourself the Training Pilot or Exam Pilot role (or remove it)")
 @app_commands.guild_only()
-@app_commands.describe(pilot="Którą rolę chcesz dostać", akcja="Domyślnie: Dodaj")
+@app_commands.describe(pilot="Which role you want", action="Default: Add")
 @app_commands.choices(
     pilot=[
         app_commands.Choice(name="Training Pilot", value="training"),
         app_commands.Choice(name="Exam Pilot", value="exam"),
     ],
-    akcja=[app_commands.Choice(name="Dodaj", value="add"), app_commands.Choice(name="Usuń", value="remove")],
+    action=[app_commands.Choice(name="Add", value="add"), app_commands.Choice(name="Remove", value="remove")],
 )
-async def rola(
+async def role(
     interaction: discord.Interaction,
     pilot: app_commands.Choice[str],
-    akcja: app_commands.Choice[str] | None = None,
+    action: app_commands.Choice[str] | None = None,
 ):
     await interaction.response.defer(ephemeral=True)
     selected = interaction.guild.get_role(pilot_role_id(pilot.value))
@@ -1107,7 +1108,7 @@ async def rola(
             "Bot potrzebuje uprawnienia Zarządzanie rolami, a jego rola musi być ponad wybraną rolą pilota.",
             ephemeral=True,
         )
-    remove = akcja is not None and akcja.value == "remove"
+    remove = action is not None and action.value == "remove"
     has_role = selected in member.roles
     if remove and not has_role:
         return await interaction.followup.send(f"Nie masz roli **{selected.name}**.", ephemeral=True)
@@ -1115,9 +1116,9 @@ async def rola(
         return await interaction.followup.send(f"Masz już rolę **{selected.name}**.", ephemeral=True)
     try:
         if remove:
-            await member.remove_roles(selected, reason="Samodzielny wybór /rola")
+            await member.remove_roles(selected, reason="Samodzielny wybór /role")
         else:
-            await member.add_roles(selected, reason="Samodzielny wybór /rola")
+            await member.add_roles(selected, reason="Samodzielny wybór /role")
         await interaction.followup.send(
             f"✅ {'Usunięto' if remove else 'Dodano'} rolę **{selected.name}**.",
             ephemeral=True,
@@ -1515,7 +1516,7 @@ async def _before_check_mod_expiry():
 # ----------------------------------------------------------------------------
 # WŁASNE KOMENDY RÓL: konfigurowane w CoreOPS (Configuration -> Discord bot -> Role commands)
 # ----------------------------------------------------------------------------
-RESERVED_COMMANDS = {"tapeta", "metar", "taf", "bookings", "rola", "mod"}
+RESERVED_COMMANDS = {"wallpaper", "metar", "taf", "bookings", "role", "mod"}
 # role z takimi uprawnieniami nigdy nie są nadawane komendą - pomyłka w panelu nie może dać nikomu admina
 DANGEROUS_PERMISSIONS = (
     "administrator", "manage_guild", "manage_roles", "manage_channels", "manage_webhooks", "manage_messages",
