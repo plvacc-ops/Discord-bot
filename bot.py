@@ -220,6 +220,10 @@ try:  # older databases: the poll's header message (deleted after the results)
     db.execute("ALTER TABLE polls ADD COLUMN header_id INTEGER")
 except sqlite3.OperationalError:
     pass
+try:  # older databases: the server a case belongs to (the timers work per case)
+    db.execute("ALTER TABLE mod_cases ADD COLUMN guild_id INTEGER NOT NULL DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
 db.commit()
 
 # ----------------------------------------------------------------------------
@@ -251,6 +255,21 @@ class PlvaccBot(discord.Client):
 
     async def on_ready(self):
         log.info("Logged in as %s", self.user)
+        log.info(
+            "The bot is on %d server(s): %s",
+            len(self.guilds),
+            ", ".join(f"{g.name} ({g.id})" for g in self.guilds) or "none",
+        )
+        guild = get_guild()
+        log.info(
+            "Server used for panel actions and timers: %s (GUILD_ID from .env: %s)",
+            f"{guild.name} ({guild.id})" if guild else "NOT FOUND",
+            GUILD_ID or "not set",
+        )
+        if COREOPS_URL and COREOPS_TOKEN:
+            log.info("CoreOPS panel: %s (checking every %d s)", COREOPS_URL, SYNC_SECONDS)
+        else:
+            log.warning("CoreOPS panel: DISABLED - COREOPS_URL and COREOPS_TOKEN are not both set in .env, so no settings are received.")
 
 
 client = PlvaccBot()
@@ -1214,7 +1233,14 @@ def is_moderator(interaction: discord.Interaction) -> bool:
     if is_board(interaction) or user.guild_permissions.administrator:
         return True
     allowed = moderator_role_ids()
-    return bool(allowed) and any(r.id in allowed for r in user.roles)
+    ok = bool(allowed) and any(r.id in allowed for r in user.roles)
+    if not ok:
+        log.info(
+            "Moderation refused for %s (%s): their roles %s; moderator roles %s; Board role %s; settings last received %s",
+            user, user.id, [r.id for r in user.roles], sorted(allowed), board_role_id(),
+            int(last_sync_ts) or "never",
+        )
+    return ok
 
 
 def mod_embed(guild: discord.Guild, action: str, case_id: int, reason: str, expires_ts: int | None, moderator: str):
@@ -1317,8 +1343,8 @@ async def apply_moderation(
 
     cur = db.execute(
         "INSERT INTO mod_cases (ts, action, target_id, target_name, mod_id, mod_name, reason, duration_s, "
-        "expires_ts, source, action_id, reported) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)",
-        (int(time.time()), action, target_id, target_name, mod_id, mod_name, reason, duration_s, expires_ts, source, action_id),
+        "expires_ts, source, action_id, guild_id, reported) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)",
+        (int(time.time()), action, target_id, target_name, mod_id, mod_name, reason, duration_s, expires_ts, source, action_id, guild.id),
     )
     db.commit()
     case_id = cur.lastrowid
@@ -1497,14 +1523,14 @@ tree.add_command(mod_group)
 @tasks.loop(seconds=30)
 async def check_mod_expiry():
     """Automatic removal of mutes and temporary bans."""
-    guild = get_guild()
-    if guild is None:
-        return
     rows = db.execute(
-        "SELECT id, action, target_id FROM mod_cases WHERE active=1 AND expires_ts IS NOT NULL AND expires_ts<=?",
+        "SELECT id, action, target_id, guild_id FROM mod_cases WHERE active=1 AND expires_ts IS NOT NULL AND expires_ts<=?",
         (int(time.time()),),
     ).fetchall()
-    for case_id, action, target_id in rows:
+    for case_id, action, target_id, case_guild_id in rows:
+        guild = (client.get_guild(case_guild_id) if case_guild_id else None) or get_guild()
+        if guild is None:
+            continue
         try:
             if action == "mute":
                 role = guild.get_role(setting_id("muted_role_id", 0))
@@ -1534,9 +1560,9 @@ async def check_mod_expiry():
         db.execute("UPDATE mod_cases SET active=0 WHERE id=?", (case_id,))
         if undo:
             db.execute(
-                "INSERT INTO mod_cases (ts, action, target_id, mod_name, reason, source, reported) "
-                "VALUES (?, ?, ?, 'Automatic', ?, 'auto', 0)",
-                (int(time.time()), undo, target_id, f"The penalty of case #{case_id} has expired"),
+                "INSERT INTO mod_cases (ts, action, target_id, mod_name, reason, source, guild_id, reported) "
+                "VALUES (?, ?, ?, 'Automatic', ?, 'auto', ?, 0)",
+                (int(time.time()), undo, target_id, f"The penalty of case #{case_id} has expired", guild.id),
             )
         db.commit()
 
@@ -1711,6 +1737,7 @@ async def coreops_bookings(date: str) -> list[dict]:
 pending_results: list[dict] = []  # command results to send back at the next exchange
 last_sync_ts = 0.0  # when the settings were last received from CoreOPS
 last_sync_error = ""  # why the last exchange failed (empty = it worked)
+last_logged_rev = ""  # the settings revision that was last written to the log
 
 
 _commands_copied = False
@@ -1739,6 +1766,24 @@ async def sync_commands() -> None:
             log.error(
                 "Is the bot on server %s, and was it invited with the 'bot' and 'applications.commands' scopes?", GUILD_ID
             )
+
+
+async def guild_for_user(user_id: int) -> discord.Guild | None:
+    """The configured server; with several servers and none configured: the only one the user is a member of."""
+    guild = get_guild()
+    if guild is not None:
+        return guild
+    found = []
+    for candidate in client.guilds:
+        member = candidate.get_member(user_id)
+        if member is None:
+            try:
+                member = await candidate.fetch_member(user_id)
+            except discord.HTTPException:
+                member = None
+        if member is not None:
+            found.append(candidate)
+    return found[0] if len(found) == 1 else None
 
 
 def get_guild() -> discord.Guild | None:
@@ -1822,6 +1867,9 @@ async def run_action(action: dict) -> tuple[bool, str]:
         return True, "Slash commands re-registered."
     if kind == "poll_create":
         guild = get_guild()
+        if guild is None:  # several servers and none configured: the publishing channel tells which one
+            first = str(payload.get("channels", "")).split(",")[0].strip()
+            guild = getattr(client.get_channel(int(first)), "guild", None) if first.isdigit() else None
         if guild is None:
             return False, "The bot cannot find the server - set the Server ID in CoreOPS (Discord bot -> Settings) or GUILD_ID in the bot's .env."
         poll_id, channel, _ = await create_poll(
@@ -1859,12 +1907,12 @@ async def run_action(action: dict) -> tuple[bool, str]:
         db.commit()
         return True, f"Poll access {'granted to' if kind == 'access_grant' else 'removed from'} {uid}."
     if kind == "mod_action":
-        guild = get_guild()
-        if guild is None:
-            return False, "The bot cannot find the server - set the Server ID in CoreOPS (Discord bot -> Settings) or GUILD_ID in the bot's .env."
         uid = str(payload.get("user_id", ""))
         if not re.fullmatch(r"\d{17,20}", uid):
             return False, "Wrong user ID."
+        guild = await guild_for_user(int(uid))
+        if guild is None:
+            return False, "The bot is on several servers - set the Server ID in CoreOPS (Discord bot -> Settings) or GUILD_ID in the bot's .env."
         case_id, dm, name = await apply_moderation(
             guild,
             str(payload.get("action", "")),
@@ -1928,6 +1976,18 @@ async def sync_with_coreops() -> int:
     config = data.get("config")
     if isinstance(config, dict):
         apply_panel_config(config)
+        global last_logged_rev
+        if panel_rev != last_logged_rev:
+            last_logged_rev = panel_rev
+            log.info(
+                "Settings received from CoreOPS (revision %s): moderator roles %s, Board role %s, Muted role %s, server ID %s, functions off: %s",
+                panel_rev,
+                sorted(moderator_role_ids()) or "none",
+                board_role_id(),
+                setting_id("muted_role_id", 0) or "none",
+                setting_id("guild_id", 0) or "none",
+                [k for k, v in panel_features.items() if not v] or "none",
+            )
         await refresh_role_commands(sync=True)
         try:
             CONFIG_CACHE.write_text(json.dumps(config), encoding="utf-8")
