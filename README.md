@@ -1,74 +1,77 @@
-# Bot Discord Polish VACC
+# Polish VACC Discord bot
 
-Funkcje: `/wallpaper` (głosowania na tapetę miesiąca), `/metar`, `/taf`, `/bookings`, `/role`.
-Bot jest sterowany z portalu CoreOPS: **Configuration → Discord bot** (włączanie funkcji, ustawienia, głosowania, lista uprawnionych, status).
+Commands: `/wallpaper` (wallpaper of the month polls), `/metar`, `/taf`, `/bookings`, `/role`, `/mod ...` and custom role commands.
+The bot is controlled from the CoreOPS portal: **Configuration → Discord bot** (functions, settings, polls, allowed users, role commands, status)
+and **Configuration → Bot moderation** (case log and screenshots).
 
-> Bot to stale działający proces Pythona. Nie uruchamia się go na hostingu WWW ani w GitHub Actions - tylko na hostingu botów
-> (np. bot-hosting.net), VPS albo komputerze, który jest włączony cały czas.
+> The bot is a permanently running Python process. It cannot run on web hosting or in GitHub Actions - use a bot host
+> (e.g. bot-hosting.net), a VPS or a computer that is always on.
 
-## Wdrożenie na bot-hosting.net (krok po kroku)
+## Commands
 
-1. Załóż serwer: język **Python**, wersja **3.10 lub nowsza** (jeśli panel pozwala wybrać).
-2. Zakładka **Startup**:
-   - repozytorium: `https://github.com/plvacc-ops/Discord-bot`, gałąź `main` (repozytorium jest publiczne - login i token niepotrzebne),
-   - plik startowy (Bot Python file): `bot.py`.
-   Przy imporcie z GitHuba serwer musi być pusty - usuń domyślne pliki, potem **Reinstall Server**.
-   Alternatywa: wgraj pliki ręcznie (File Manager / SFTP) do katalogu głównego serwera.
-3. Pakiety (`discord.py`, `aiohttp`, `python-dotenv`) instalują się z `requirements.txt`. Jeśli nie, wpisz je w „Additional Python packages”:
+| Command | What it does |
+| --- | --- |
+| `/wallpaper` | wallpaper of the month polls; after the results the bot **deletes the voting messages** (the winning images are re-uploaded in the results) |
+| `/metar`, `/taf` | weather from aviationweather.gov |
+| `/bookings` | ATC bookings from the **Core VACC API** (through CoreOPS - the Core VACC token stays in CoreOPS) |
+| `/role` | Training Pilot / Exam Pilot roles |
+| `/mod warn / mute / unmute / timeout / kick / ban / unban / history` | moderation: the penalty, a private message to the punished person, a case in the CoreOPS log |
+| custom role commands | defined in CoreOPS (Configuration → Discord bot → Role commands) |
+
+**Moderation.** `/mod` commands are for the Board role, the moderator role (set in CoreOPS) and administrators. Every penalty gets a case number,
+shows up in **CoreOPS → Configuration → Bot moderation** (where screenshots can be attached) and is sent to the punished person in a private message.
+`mute` uses the Muted role (its ID is set in CoreOPS; the role has to deny sending messages and speaking in your channels), `timeout` is Discord's
+built-in timeout (up to 28 days). Mutes and temporary bans are removed automatically. Bot permissions: Manage Roles, Kick Members, Ban Members,
+Moderate Members; the bot's role must be **above** the roles of the people it punishes and above the Muted role.
+
+**Custom role commands.** In CoreOPS you define the command name, description, role and mode (toggle / add only / remove only), optionally a role
+required to use it. The bot registers them with Discord after you save. Roles with administrative permissions (Administrator, Manage Server / Roles /
+Channels / Messages, kick, ban, timeout...) are never handed out by a command.
+
+## Deployment on bot-hosting.net (step by step)
+
+1. Create a server: language **Python**, version **3.10 or newer** (if the panel lets you choose).
+2. **Startup** tab:
+   - repository: `https://github.com/plvacc-ops/Discord-bot`, branch `main` (the repository is public - no login or token needed),
+   - startup file (Bot Python file): `bot.py`.
+
+   For a GitHub import the server has to be empty - delete the default files, then **Reinstall Server**.
+   Alternative: upload the files by hand (File Manager / SFTP) to the root directory of the server.
+3. The packages (`discord.py`, `aiohttp`, `python-dotenv`) are installed from `requirements.txt`. If not, enter them in "Additional Python packages":
    `discord.py aiohttp python-dotenv`.
-4. Sekrety - **to jedyna rzecz, którą trzeba wpisać ręcznie**. W File Manager utwórz plik `.env` (wzór: `.env.example`) albo dodaj te same nazwy w menedżerze zmiennych:
+4. Secrets - **the only thing to type in by hand**. In the File Manager create a `.env` file (template: `.env.example`) or add the same names in the
+   panel's variable manager:
    ```
    DISCORD_TOKEN=...        (Discord Developer Portal -> Bot -> Reset Token)
-   GUILD_ID=...             (ID serwera Discord)
-   COREOPS_URL=https://adres-portalu-coreops
-   COREOPS_TOKEN=...        (ten sam, co 'bot' => ['api_token' => ...] w config/config.php CoreOPS)
+   GUILD_ID=...             (ID of the Discord server)
+   COREOPS_URL=https://address-of-the-coreops-portal
+   COREOPS_TOKEN=...        (the same as 'bot' => ['api_token' => ...] in CoreOPS config/config.php)
    ```
-5. Uruchom serwer. W CoreOPS (Configuration → Discord bot) status zmieni się na **online** w ciągu kilkunastu sekund.
+5. Start the server. In CoreOPS (Configuration → Discord bot) the status changes to **online** within a few seconds.
 
-W Discord Developer Portal włącz **Message Content Intent**. Bot potrzebuje na serwerze: wysyłanie wiadomości, osadzanie linków,
-załączniki, dodawanie reakcji i (dla `/role`) Zarządzanie rolami - jego rola musi być ponad rolami Training/Exam Pilot.
+In the Discord Developer Portal switch on the **Message Content Intent**. On the server the bot needs: send messages, embed links, attach files,
+add reactions, Manage Roles (for `/role`, role commands and mutes), Kick Members, Ban Members and Moderate Members.
 
-## Funkcje
+## Connection with CoreOPS
 
-| Komenda | Co robi |
+The bot **connects to CoreOPS itself** (every 15 s, `POST /api/bot.php`, header `Authorization: Bearer <token>`): it sends its state (running,
+polls, allowed users, cases) and receives the settings and commands from the panel. No ports have to be opened and the Discord token never goes
+to CoreOPS. If CoreOPS is unreachable the bot keeps working with the last settings (`coreops_config.json`).
+Without `COREOPS_URL` and `COREOPS_TOKEN` the bot runs on its own (all functions on; `/bookings` needs CoreOPS).
+
+Generate the API token in CoreOPS' shell: `php -r "echo bin2hex(random_bytes(32));"` and put it in the portal's `config/config.php` and in the bot's `.env`.
+
+## Files
+
+| File | Meaning |
 | --- | --- |
-| `/wallpaper` | głosowania na tapetę miesiąca; po wynikach bot **usuwa wiadomości z głosowania** (zwycięskie obrazy są ponownie wgrywane w wynikach) |
-| `/metar`, `/taf` | pogoda z aviationweather.gov |
-| `/bookings` | rezerwacje ATC z **API Core VACC** (przez CoreOPS - token Core VACC zostaje w CoreOPS) |
-| `/role` | role Training Pilot / Exam Pilot |
-| `/mod warn / mute / unmute / timeout / kick / ban / unban / history` | moderacja: kara, wiadomość prywatna do ukaranego, sprawa w logu CoreOPS |
-| własne komendy ról | definiowane w CoreOPS (Configuration → Discord bot → Role commands) |
+| `bot.py` | the whole bot |
+| `requirements.txt` | Python packages |
+| `.env` | secrets - you create it on the server, **it never goes to GitHub** (`.gitignore`) |
+| `tapeta.db` | SQLite database of polls, allowed users and moderation cases (created automatically). **"Reinstall Server" wipes the files - back it up first** |
+| `coreops_config.json` | the last settings from the panel (created automatically) |
 
-**Moderacja.** Komendy `/mod` są dla roli Board, roli moderatora (ustawiana w CoreOPS) i administratorów. Każda kara dostaje numer sprawy,
-trafia do **CoreOPS → Configuration → Bot moderation** (z możliwością dodania zrzutów ekranu) i jest wysyłana ukaranemu w wiadomości prywatnej.
-Wyciszenie (`mute`) korzysta z roli Muted (ID w ustawieniach CoreOPS; rola musi blokować pisanie i mówienie na kanałach), a `timeout` to wbudowana
-przerwa Discorda (do 28 dni). Wyciszenia i bany czasowe zdejmują się same. Uprawnienia bota: Zarządzanie rolami, Wyrzucanie członków, Banowanie członków,
-Moderowanie członków; rola bota musi być **wyżej** niż role osób, które ma karać, i niż rola Muted.
+## Updating
 
-**Własne komendy ról.** W CoreOPS definiujesz nazwę komendy, opis, rolę i tryb (przełącz / tylko dodaj / tylko usuń), opcjonalnie rolę wymaganą do użycia.
-Bot sam rejestruje je w Discordzie po zapisaniu. Role z uprawnieniami administracyjnymi (administrator, zarządzanie serwerem/rolami/kanałami/wiadomościami,
-kick, ban, timeout...) nigdy nie są nadawane komendą.
-
-## Połączenie z CoreOPS
-
-Bot **sam łączy się** z CoreOPS (co 15 s, `POST /api/bot.php`, nagłówek `Authorization: Bearer <token>`): wysyła stan (czy działa,
-głosowania, lista uprawnionych), a odbiera ustawienia i polecenia z panelu. Nie trzeba otwierać żadnych portów, a token Discorda
-nigdy nie trafia do CoreOPS. Gdy CoreOPS jest niedostępny, bot działa dalej z ostatnimi ustawieniami (`coreops_config.json`).
-Bez `COREOPS_URL` i `COREOPS_TOKEN` bot działa samodzielnie (wszystkie funkcje włączone).
-
-Token API wygeneruj w CoreOPS: `php -r "echo bin2hex(random_bytes(32));"` i wpisz go w `config/config.php` portalu oraz w `.env` bota.
-
-## Pliki
-
-| Plik | Znaczenie |
-| --- | --- |
-| `bot.py` | cały bot |
-| `requirements.txt` | pakiety Pythona |
-| `.env` | tajne ustawienia - tworzysz sam na serwerze, **nigdy nie trafia do GitHuba** (`.gitignore`) |
-| `tapeta.db` | baza SQLite głosowań i uprawnień (powstaje sama). **„Reinstall Server” czyści pliki - zrób wcześniej kopię** |
-| `coreops_config.json` | ostatnie ustawienia z panelu (powstaje sama) |
-
-## Aktualizacja
-
-Zmiany w kodzie trafiają na serwer po restarcie (bot-hosting.net pobiera repozytorium przy każdym starcie). `.env` i `tapeta.db`
-nie są w repozytorium, więc aktualizacja ich nie nadpisuje.
+Code changes reach the server after a restart (bot-hosting.net pulls the repository on every start). `.env` and `tapeta.db` are not in the
+repository, so an update does not overwrite them.
