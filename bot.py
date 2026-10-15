@@ -50,6 +50,7 @@ MIN_ENTRIES, MAX_ENTRIES = 3, 10
 DB_PATH = Path(__file__).with_name("tapeta.db")
 
 WEATHER_API = "https://aviationweather.gov/api/data"
+VATSIM_API = "https://api.vatsim.net/v2"  # Core API: Discord ID -> VATSIM ID
 # Note: the User-Agent must not contain the word "DiscordBot" - the CoreOPS host firewall takes it for a fake Discord crawler and answers 406.
 USER_AGENT = "PLVACC-CoreOPS/2.1 (+https://plvacc.pl)"
 
@@ -1291,6 +1292,38 @@ async def send_mod_dm(user_id: int, embed: discord.Embed) -> str:
 
 
 modlog_error = ""  # why the last message to the moderation log channel failed (empty = fine)
+_cid_cache: dict[int, tuple[float, str | None]] = {}
+
+
+async def vatsim_cid(discord_id: int) -> str | None:
+    """VATSIM ID (PID) of a Discord user from the VATSIM Core API (GET /members/discord/{id}).
+
+    Returns the ID, \"\" when the person has not linked Discord on VATSIM (404), None when the API could not be asked.
+    """
+    hit = _cid_cache.get(discord_id)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    result: str | None = None
+    ttl = 60
+    try:
+        async with client.web.get(
+            f"{VATSIM_API}/members/discord/{discord_id}", timeout=aiohttp.ClientTimeout(total=6)
+        ) as response:
+            if response.status == 200:
+                data = await response.json(content_type=None)
+                value = str(data.get("id") or "") if isinstance(data, dict) else ""
+                if value.isdigit():
+                    result, ttl = value, 1800
+            elif response.status == 404:
+                result, ttl = "", 300
+            else:
+                log.warning("The VATSIM API answered %s for Discord user %s", response.status, discord_id)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+        log.warning("The VATSIM API could not be reached: %s: %s", type(error).__name__, error)
+    if len(_cid_cache) > 500:
+        _cid_cache.clear()
+    _cid_cache[discord_id] = (time.monotonic() + ttl, result)
+    return result
 
 
 async def post_mod_log(
@@ -1315,6 +1348,16 @@ async def post_mod_log(
         emoji, title = MOD_ACTIONS[action]
         embed = discord.Embed(title=f"{emoji} {title} - case #{case_id}", color=EMBED_COLOR, timestamp=datetime.now(TZ))
         embed.add_field(name="User", value=f"<@{target_id}> `{target_id}`", inline=False)
+        cid = await vatsim_cid(target_id)
+        embed.add_field(
+            name="VATSIM ID (PID)",
+            value=(
+                f"[{cid}](https://stats.vatsim.net/stats/{cid})"
+                if cid
+                else "not linked (the user has not connected Discord on VATSIM)" if cid == "" else "unavailable (VATSIM API)"
+            ),
+            inline=False,
+        )
         embed.add_field(name="Moderator", value=(moderator or "-")[:100], inline=True)
         embed.add_field(
             name="Source",
