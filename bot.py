@@ -1,4 +1,4 @@
-"""Bot Polish VACC: głosowania na tapetę miesiąca, METAR/TAF, rezerwacje ATC i role pilotów."""
+"""Polish VACC bot: wallpaper of the month polls, METAR/TAF, ATC bookings, pilot roles, moderation and role commands - controlled from CoreOPS."""
 import asyncio
 import io
 import json
@@ -19,37 +19,37 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 # ----------------------------------------------------------------------------
-# KONFIGURACJA
+# CONFIGURATION
 # ----------------------------------------------------------------------------
 load_dotenv(Path(__file__).with_name(".env"))
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 GUILD_ID = os.getenv("GUILD_ID", "875305430321086485")
 
-BOARD_ROLE_ID = int(os.getenv("BOARD_ROLE_ID", "1394941236284227604"))  # rola Board - zarządza uprawnieniami
+BOARD_ROLE_ID = int(os.getenv("BOARD_ROLE_ID", "1394941236284227604"))  # Board role - manages the poll access list
 PILOT_ROLES = {
     "training": int(os.getenv("TRAINING_PILOT_ROLE_ID", "1103329876053872780")),
     "exam": int(os.getenv("EXAM_PILOT_ROLE_ID", "1103330255760007229")),
 }
 
-# Panel CoreOPS (Configuration -> Discord bot): bot łączy się z CoreOPS, pobiera ustawienia i polecenia, odsyła swój stan.
-# Bez COREOPS_URL i COREOPS_TOKEN działa samodzielnie (wszystkie funkcje włączone, wartości z .env).
+# CoreOPS panel (Configuration -> Discord bot): the bot connects to CoreOPS, fetches settings and commands and reports its state.
+# Without COREOPS_URL and COREOPS_TOKEN it runs on its own (all functions on, values from .env).
 COREOPS_URL = os.getenv("COREOPS_URL", "").strip().rstrip("/")
 COREOPS_TOKEN = os.getenv("COREOPS_TOKEN", "").strip()
 SYNC_SECONDS = 15
 VERSION = "2.1-coreops"
 STARTED_AT = int(time.time())
-CONFIG_CACHE = Path(__file__).with_name("coreops_config.json")  # ostatnie ustawienia z panelu (gdy CoreOPS jest niedostępny)
+CONFIG_CACHE = Path(__file__).with_name("coreops_config.json")  # last settings from the panel (used when CoreOPS is unreachable)
 
 EMBED_COLOR = 0xBD0505
 ORG_NAME = "Polish VACC"
 VOTE_EMOJI = "👍"
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
-TZ = timezone.utc  # wszystkie podawane daty i godziny są w UTC
+TZ = timezone.utc  # all dates and times are UTC
 MIN_ENTRIES, MAX_ENTRIES = 3, 10
 DB_PATH = Path(__file__).with_name("tapeta.db")
 
 WEATHER_API = "https://aviationweather.gov/api/data"
-# Uwaga: User-Agent bez słowa "DiscordBot" - zapora hostingu CoreOPS traktuje je jako podszywanie się pod crawler Discorda i zwraca 406.
+# Note: the User-Agent must not contain the word "DiscordBot" - the CoreOPS host firewall takes it for a fake Discord crawler and answers 406.
 USER_AGENT = "PLVACC-CoreOPS/2.1 (+https://plvacc.pl)"
 
 NO_PINGS = discord.AllowedMentions.none()
@@ -58,9 +58,9 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("plvacc-bot")
 
 # ----------------------------------------------------------------------------
-# USTAWIENIA Z PANELU COREOPS (puste = domyślne: wszystko włączone, wartości z .env)
+# SETTINGS FROM THE COREOPS PANEL (empty = defaults: everything on, values from .env)
 # ----------------------------------------------------------------------------
-# nazwa komendy slash -> klucz funkcji w panelu CoreOPS (klucze zostają stare, żeby nie zgubić zapisanych ustawień)
+# slash command name -> function key in the CoreOPS panel (the keys keep their old names so saved settings are not lost)
 COMMAND_FEATURES = {"wallpaper": "tapeta", "metar": "metar", "taf": "taf", "bookings": "bookings", "role": "rola", "mod": "moderation"}
 panel_features: dict[str, bool] = {}
 panel_settings: dict = {}
@@ -124,7 +124,7 @@ def poll_limits() -> tuple[int, int]:
 
 
 def disabled_message() -> str:
-    return str(panel_settings.get("disabled_message") or "Ta funkcja jest chwilowo wyłączona.")[:200]
+    return str(panel_settings.get("disabled_message") or "This function is switched off at the moment.")[:200]
 
 
 def command_cooldown(name: str) -> int:
@@ -136,7 +136,7 @@ def command_cooldown(name: str) -> int:
 
 
 class PlvaccTree(app_commands.CommandTree):
-    """Przed każdą komendą: czy funkcja jest włączona w panelu i czy użytkownik nie przekracza cooldownu."""
+    """Before every command: is the function switched on in the panel, and is the user within the cooldown."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         command = interaction.command
@@ -152,7 +152,7 @@ class PlvaccTree(app_commands.CommandTree):
             key = (name, interaction.user.id)
             wait = _cooldowns.get(key, 0.0) - now
             if wait > 0:
-                await interaction.response.send_message(f"Spróbuj ponownie za {math.ceil(wait)} s.", ephemeral=True)
+                await interaction.response.send_message(f"Try again in {math.ceil(wait)} s.", ephemeral=True)
                 return False
             if len(_cooldowns) > 2000:
                 _cooldowns.clear()
@@ -160,7 +160,7 @@ class PlvaccTree(app_commands.CommandTree):
         return True
 
 # ----------------------------------------------------------------------------
-# BAZA DANYCH (SQLite - przetrwa restart bota)
+# DATABASE (SQLite - survives a restart of the bot)
 # ----------------------------------------------------------------------------
 db = sqlite3.connect(DB_PATH)
 db.executescript(
@@ -201,23 +201,23 @@ db.executescript(
         dm TEXT NOT NULL DEFAULT '',
         source TEXT NOT NULL DEFAULT 'discord',
         action_id TEXT NOT NULL DEFAULT '',
-        reported INTEGER NOT NULL DEFAULT 0   -- 0 = do wysłania do CoreOPS, 1 = wysłane, 2 = w trakcie wykonywania
+        reported INTEGER NOT NULL DEFAULT 0   -- 0 = to send to CoreOPS, 1 = sent, 2 = being carried out
     );
     """
 )
-try:  # starsze bazy: wiadomość nagłówkowa głosowania (do usunięcia po wynikach)
+try:  # older databases: the poll's header message (deleted after the results)
     db.execute("ALTER TABLE polls ADD COLUMN header_id INTEGER")
 except sqlite3.OperationalError:
     pass
 db.commit()
 
 # ----------------------------------------------------------------------------
-# KLIENT
+# CLIENT
 # ----------------------------------------------------------------------------
 class PlvaccBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True  # bez tego bot nie widzi załączników w cudzych wiadomościach
+        intents.message_content = True  # without it the bot cannot see attachments of other people's messages
         super().__init__(intents=intents)
         self.tree = PlvaccTree(self)
         self.web: aiohttp.ClientSession | None = None
@@ -239,7 +239,7 @@ class PlvaccBot(discord.Client):
         await super().close()
 
     async def on_ready(self):
-        log.info("Zalogowano jako %s", self.user)
+        log.info("Logged in as %s", self.user)
 
 
 client = PlvaccBot()
@@ -247,17 +247,17 @@ tree = client.tree
 
 
 class UserError(Exception):
-    """Błąd, który pokazujemy użytkownikowi."""
+    """An error that is shown to the user."""
 
 
 # ----------------------------------------------------------------------------
-# POMOCNICZE: ZAPYTANIA HTTP Z KRÓTKIM CACHE
+# HELPERS: HTTP REQUESTS WITH A SHORT CACHE
 # ----------------------------------------------------------------------------
 _cache: dict[tuple, tuple[float, object]] = {}
 
 
 async def fetch(url: str, params: dict | None = None, ttl: int = 60):
-    """GET zwracający sparsowany JSON albo None, gdy API nie ma danych (204 / pusta odpowiedź)."""
+    """GET returning parsed JSON, or None when the API has no data (204 / empty answer)."""
     key = (url, tuple(sorted((params or {}).items())))
     hit = _cache.get(key)
     if hit and hit[0] > time.monotonic():
@@ -265,7 +265,7 @@ async def fetch(url: str, params: dict | None = None, ttl: int = 60):
     try:
         async with client.web.get(url, params=params) as response:
             if response.status == 429:
-                raise UserError("Limit zapytań do API. Spróbuj ponownie za minutę.")
+                raise UserError("API rate limit reached. Try again in a minute.")
             if response.status == 204:
                 result = None
             else:
@@ -273,8 +273,8 @@ async def fetch(url: str, params: dict | None = None, ttl: int = 60):
                 text = (await response.text()).strip()
                 result = json.loads(text) if text else None
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
-        log.warning("API %s niedostępne: %s: %s", url, type(error).__name__, error)
-        raise UserError("Nie udało się pobrać danych z API. Spróbuj ponownie za chwilę.") from error
+        log.warning("API %s unavailable: %s: %s", url, type(error).__name__, error)
+        raise UserError("Could not fetch data from the API. Try again in a moment.") from error
     if len(_cache) > 500:
         _cache.clear()
     _cache[key] = (time.monotonic() + ttl, result)
@@ -282,7 +282,7 @@ async def fetch(url: str, params: dict | None = None, ttl: int = 60):
 
 
 # ----------------------------------------------------------------------------
-# UPRAWNIENIA
+# PERMISSIONS
 # ----------------------------------------------------------------------------
 def is_board(interaction: discord.Interaction) -> bool:
     return isinstance(interaction.user, discord.Member) and any(
@@ -300,13 +300,13 @@ def is_allowed(interaction: discord.Interaction) -> bool:
 def extract_id(text: str) -> int:
     m = re.search(r"\d{17,20}", text)
     if not m:
-        raise UserError("Podaj poprawne ID użytkownika (lub oznacz go przez @).")
+        raise UserError("Give a valid user ID (or mention the user with @).")
     return int(m.group())
 
 
 async def grant_access(interaction: discord.Interaction, text: str):
     if not is_board(interaction):
-        return await interaction.response.send_message("❌ Tylko rola **Board** może to robić.", ephemeral=True)
+        return await interaction.response.send_message("❌ Only the **Board** role can do this.", ephemeral=True)
     try:
         uid = extract_id(text)
     except UserError as e:
@@ -316,13 +316,13 @@ async def grant_access(interaction: discord.Interaction, text: str):
     )
     db.commit()
     await interaction.response.send_message(
-        f"✅ <@{uid}> (`{uid}`) może teraz tworzyć głosowania.", ephemeral=True, allowed_mentions=NO_PINGS
+        f"✅ <@{uid}> (`{uid}`) can now create polls.", ephemeral=True, allowed_mentions=NO_PINGS
     )
 
 
 async def revoke_access(interaction: discord.Interaction, text: str):
     if not is_board(interaction):
-        return await interaction.response.send_message("❌ Tylko rola **Board** może to robić.", ephemeral=True)
+        return await interaction.response.send_message("❌ Only the **Board** role can do this.", ephemeral=True)
     try:
         uid = extract_id(text)
     except UserError as e:
@@ -330,26 +330,26 @@ async def revoke_access(interaction: discord.Interaction, text: str):
     db.execute("DELETE FROM permissions WHERE user_id=?", (uid,))
     db.commit()
     await interaction.response.send_message(
-        f"✅ Odebrano uprawnienia: <@{uid}> (`{uid}`).", ephemeral=True, allowed_mentions=NO_PINGS
+        f"✅ Permission removed: <@{uid}> (`{uid}`).", ephemeral=True, allowed_mentions=NO_PINGS
     )
 
 
 async def list_access(interaction: discord.Interaction):
     if not is_board(interaction):
-        return await interaction.response.send_message("❌ Tylko rola **Board** może to robić.", ephemeral=True)
+        return await interaction.response.send_message("❌ Only the **Board** role can do this.", ephemeral=True)
     rows = db.execute("SELECT user_id FROM permissions").fetchall()
-    text = "\n".join(f"• <@{r[0]}> (`{r[0]}`)" for r in rows) or "Brak dodatkowych osób (tylko rola Board)."
+    text = "\n".join(f"• <@{r[0]}> (`{r[0]}`)" for r in rows) or "No additional people (only the Board role)."
     await interaction.response.send_message(text, ephemeral=True, allowed_mentions=NO_PINGS)
 
 
 # ----------------------------------------------------------------------------
-# TAPETA MIESIĄCA: TWORZENIE GŁOSOWANIA
+# WALLPAPER OF THE MONTH: CREATING A POLL
 # ----------------------------------------------------------------------------
 REF_RE = re.compile(r"discord(?:app)?\.com/channels/\d+/(\d+)/(\d+)|\b(\d{17,20})\b")
 
 
 def parse_refs(text: str, default_channel_id: int) -> list[tuple[int, int]]:
-    """Wyciąga (channel_id, message_id) z linków i/lub samych ID."""
+    """Extracts (channel_id, message_id) from links and/or bare IDs."""
     refs = []
     for chan, msg, bare in REF_RE.findall(text):
         if bare:
@@ -370,29 +370,29 @@ def parse_end(text: str) -> datetime:
             dt = dt.replace(hour=23, minute=59)
         dt = dt.replace(tzinfo=TZ)
         if dt <= datetime.now(TZ):
-            raise UserError("Termin końca głosowania musi być w przyszłości.")
+            raise UserError("The end of the poll must be in the future.")
         return dt
-    raise UserError("Zły format daty. Użyj np. `31.10.2026 20:00` (UTC) lub `31.10.2026`.")
+    raise UserError("Wrong date format. Use e.g. `31.10.2026 20:00` (UTC) or `31.10.2026`.")
 
 
 def resolve_channels(guild: discord.Guild, default_channel, default_source_id: int | None, text: str):
-    """Zwraca (kanał publikacji, ID kanału ze źródłowymi wiadomościami)."""
+    """Returns (publishing channel, ID of the channel with the source messages)."""
     channel, source_id = default_channel, default_source_id
     if text.strip():
         try:
             ids = [int(part) for part in text.split(",")]
         except ValueError:
-            raise UserError("ID kanałów muszą być liczbami oddzielonymi przecinkiem.")
+            raise UserError("Channel IDs must be numbers separated by a comma.")
         if len(ids) > 2:
-            raise UserError("Podaj najwyżej dwa ID kanałów oddzielone przecinkiem.")
+            raise UserError("Give at most two channel IDs separated by a comma.")
         channel = guild.get_channel_or_thread(ids[0])
         if len(ids) == 2:
             source = guild.get_channel_or_thread(ids[1])
             if not isinstance(source, (discord.TextChannel, discord.Thread)):
-                raise UserError("Nie znaleziono kanału źródłowego na tym serwerze.")
+                raise UserError("The source channel was not found on this server.")
             source_id = source.id
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        raise UserError("Podaj ID kanału tekstowego tego serwera.")
+        raise UserError("Give the ID of a text channel of this server.")
     if source_id is None:
         source_id = channel.id
     return channel, source_id
@@ -402,13 +402,13 @@ async def load_entries(guild: discord.Guild, refs):
     for cid, mid in refs:
         ch = guild.get_channel_or_thread(cid)
         if ch is None:
-            raise UserError(f"Nie widzę kanału dla wiadomości `{mid}`.")
+            raise UserError(f"I cannot see the channel of message `{mid}`.")
         try:
             msg = await ch.fetch_message(mid)
         except discord.NotFound:
-            raise UserError(f"Nie znaleziono wiadomości `{mid}` na kanale {ch.mention}.")
+            raise UserError(f"Message `{mid}` was not found in {ch.mention}.")
         except discord.Forbidden:
-            raise UserError(f"Bot nie ma dostępu do kanału {ch.mention}.")
+            raise UserError(f"The bot has no access to {ch.mention}.")
         att = next(
             (
                 a
@@ -420,8 +420,8 @@ async def load_entries(guild: discord.Guild, refs):
         )
         if att is None:
             raise UserError(
-                f"Wiadomość `{mid}` nie ma załączonego obrazka. "
-                "Screen musi być wgrany jako załącznik, a nie wklejony jako link."
+                f"Message `{mid}` has no image attached. "
+                "The screenshot must be uploaded as an attachment, not pasted as a link."
             )
         items.append((msg, att))
     return items
@@ -436,31 +436,31 @@ async def create_poll(
     default_channel,
     default_source_id: int | None,
 ):
-    """Tworzy głosowanie (wspólne dla /wallpaper i panelu CoreOPS). Zwraca (numer, kanał, koniec jako timestamp)."""
+    """Creates a poll (shared by /wallpaper and the CoreOPS panel). Returns (number, channel, end as a timestamp)."""
     end_dt = parse_end(end_text)
     channel, source_id = resolve_channels(guild, default_channel, default_source_id, channels_text)
     refs = parse_refs(entries_text, source_id)
     low, high = poll_limits()
     if not (low <= len(refs) <= high):
-        raise UserError(f"Podaj od {low} do {high} wiadomości (wykryto: {len(refs)}).")
+        raise UserError(f"Give {low} to {high} messages (found: {len(refs)}).")
     if len(set(refs)) != len(refs):
-        raise UserError("Na liście są duplikaty.")
+        raise UserError("The list contains duplicates.")
     items = await load_entries(guild, refs)
 
     try:
-        # najpierw pobieramy wszystkie obrazki, żeby przy błędzie nic nie wysłać
+        # download all the images first so nothing is sent if something fails
         prepared = []
         for n, (msg, att) in enumerate(items, 1):
             data = await att.read()
             ext = Path(att.filename).suffix.lower() or ".png"
-            prepared.append((n, msg.author.id, f"tapeta_{n}{ext}", data))
+            prepared.append((n, msg.author.id, f"wallpaper_{n}{ext}", data))
 
         end_ts = int(end_dt.timestamp())
         header = discord.Embed(
-            title="📸 Tapeta miesiąca",
+            title="📸 Wallpaper of the month",
             description=(
-                f"Zagłosuj reakcją {VOTE_EMOJI} pod swoją ulubioną tapetą.\n"
-                f"Głosowanie kończy się <t:{end_ts}:F> (<t:{end_ts}:R>)."
+                f"Vote with the {VOTE_EMOJI} reaction under your favourite wallpaper.\n"
+                f"The poll ends <t:{end_ts}:F> (<t:{end_ts}:R>)."
             ),
             color=EMBED_COLOR,
         )
@@ -470,17 +470,17 @@ async def create_poll(
         vote_ids = []
         for n, author_id, fname, data in prepared:
             file = discord.File(io.BytesIO(data), filename=fname)
-            emb = discord.Embed(description=f"Autor: <@{author_id}>", color=EMBED_COLOR)
+            emb = discord.Embed(description=f"Author: <@{author_id}>", color=EMBED_COLOR)
             emb.set_image(url=f"attachment://{fname}")
-            emb.set_footer(text=f"{ORG_NAME} • głosuj reakcją {VOTE_EMOJI}")
+            emb.set_footer(text=f"{ORG_NAME} • vote with the {VOTE_EMOJI} reaction")
             sent = await channel.send(embed=emb, file=file, allowed_mentions=NO_PINGS)
             await sent.add_reaction(VOTE_EMOJI)
             vote_ids.append((n, sent.id))
     except discord.HTTPException as error:
-        log.exception("Błąd przy wysyłaniu głosowania")
+        log.exception("Error while posting the poll")
         raise UserError(
-            f"Błąd Discorda: {error}\nSprawdź, czy bot ma uprawnienia do wysyłania wiadomości, "
-            "osadzania linków, załączników i dodawania reakcji na tym kanale."
+            f"Discord error: {error}\nCheck that the bot may send messages, "
+            "embed links, attach files and add reactions in this channel."
         ) from error
 
     cur = db.execute(
@@ -496,23 +496,23 @@ async def create_poll(
     return poll_id, channel, end_ts
 
 
-class WallpaperCreateModal(discord.ui.Modal, title="Nowe głosowanie na tapetę"):
+class WallpaperCreateModal(discord.ui.Modal, title="New wallpaper poll"):
     entries = discord.ui.TextInput(
-        label="Linki do wiadomości ze screenami",
+        label="Links to the messages with the screenshots",
         style=discord.TextStyle.paragraph,
-        placeholder="Wklej linki (lub ID) do wiadomości ze screenami, oddzielone enterem lub spacją",
+        placeholder="Paste links (or IDs) of the messages with the screenshots, separated by a new line or space",
         max_length=3000,
     )
-    end_input = discord.ui.TextInput(label="Koniec: DD.MM.RRRR HH:MM (UTC)", max_length=30)
+    end_input = discord.ui.TextInput(label="End: DD.MM.YYYY HH:MM (UTC)", max_length=30)
     channel_input = discord.ui.TextInput(
-        label="ID kanałów: publikacja, źródło (opcjonalnie)", required=False, max_length=45
+        label="Channel IDs: publish, source (optional)", required=False, max_length=45
     )
 
     async def on_submit(self, interaction: discord.Interaction):
         if not feature_enabled("tapeta"):
             return await interaction.response.send_message(f"⛔ {disabled_message()}", ephemeral=True)
         if not is_allowed(interaction):
-            return await interaction.response.send_message("Nie masz uprawnień.", ephemeral=True)
+            return await interaction.response.send_message("You do not have permission.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         try:
             poll_id, channel, end_ts = await create_poll(
@@ -525,32 +525,32 @@ class WallpaperCreateModal(discord.ui.Modal, title="Nowe głosowanie na tapetę"
                 interaction.channel_id,
             )
             await interaction.followup.send(
-                f"✅ Głosowanie **#{poll_id}** wystartowało na {channel.mention}. Koniec: <t:{end_ts}:F>.",
+                f"✅ Poll **#{poll_id}** started in {channel.mention}. Ends <t:{end_ts}:F>.",
                 ephemeral=True,
             )
         except UserError as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
         except discord.HTTPException as e:
-            log.exception("Błąd przy wysyłaniu głosowania")
+            log.exception("Error while posting the poll")
             await interaction.followup.send(
-                f"❌ Błąd Discorda: {e}\nSprawdź, czy bot ma uprawnienia do wysyłania wiadomości, "
-                "osadzania linków, załączników i dodawania reakcji na tym kanale.",
+                f"❌ Discord error: {e}\nCheck that the bot may send messages, "
+                "embed links, attach files and add reactions in this channel.",
                 ephemeral=True,
             )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
-        log.exception("Błąd modala", exc_info=error)
+        log.exception("Modal error", exc_info=error)
 
 
 # ----------------------------------------------------------------------------
-# TAPETA MIESIĄCA: LISTA, ANULOWANIE, ZAKOŃCZENIE I WYNIKI
+# WALLPAPER OF THE MONTH: LIST, CANCEL, FINISH AND RESULTS
 # ----------------------------------------------------------------------------
 async def show_active_polls(interaction: discord.Interaction):
     rows = db.execute(
         "SELECT id, channel_id, end_ts FROM polls WHERE status='active' AND guild_id=? ORDER BY end_ts",
         (interaction.guild_id,),
     ).fetchall()
-    text = "\n".join(f"**#{i}** <#{c}>, koniec <t:{e}:F>" for i, c, e in rows) or "Brak aktywnych głosowań."
+    text = "\n".join(f"**#{i}** <#{c}>, ends <t:{e}:F>" for i, c, e in rows) or "No active polls."
     await interaction.response.send_message(text, ephemeral=True)
 
 
@@ -561,13 +561,13 @@ async def cancel_poll(interaction: discord.Interaction, poll_id: int):
     )
     db.commit()
     if cur.rowcount:
-        await interaction.response.send_message(f"✅ Głosowanie #{poll_id} anulowano.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Poll #{poll_id} cancelled.", ephemeral=True)
     else:
-        await interaction.response.send_message("❌ Nie ma takiego aktywnego głosowania.", ephemeral=True)
+        await interaction.response.send_message("❌ There is no such active poll.", ephemeral=True)
 
 
 async def read_image(url: str, limit: int) -> bytes | None:
-    """Pobiera obraz (do ponownego wgrania w wynikach); None, gdy się nie da albo przekracza limit."""
+    """Downloads an image (to re-upload it in the results); None when impossible or over the limit."""
     try:
         async with client.web.get(url) as response:
             if response.status != 200:
@@ -582,7 +582,7 @@ async def read_image(url: str, limit: int) -> bytes | None:
 
 async def finish_poll(poll_id: int):
     row = db.execute("SELECT channel_id, header_id FROM polls WHERE id=?", (poll_id,)).fetchone()
-    # oznaczamy od razu, żeby przy ewentualnym błędzie nie spamować wynikami co 30 s
+    # mark it at once so a failure does not post the results again every 30 s
     db.execute("UPDATE polls SET status='done' WHERE id=?", (poll_id,))
     db.commit()
     if row is None:
@@ -619,7 +619,7 @@ async def finish_poll(poll_id: int):
 
     if not results:
         await channel.send(
-            "Głosowanie zakończone, ale nie udało się odczytać żadnych zgłoszeń.", allowed_mentions=NO_PINGS
+            "The poll has ended, but none of the entries could be read.", allowed_mentions=NO_PINGS
         )
         return
 
@@ -633,8 +633,8 @@ async def finish_poll(poll_id: int):
             place, prev_votes = idx, r["votes"]
         r["place"] = place
 
-    # Usunięcie wiadomości z głosowania kasuje też ich załączniki, więc zwycięskie obrazy trzeba wgrać ponownie.
-    # Gdy się nie uda (albo usuwanie jest wyłączone w panelu) - wyniki wskazują na stare wiadomości i nic nie jest kasowane.
+    # Deleting the voting messages also deletes their attachments, so the winning images have to be uploaded again.
+    # If that fails (or deleting is switched off in the panel) the results point at the old messages and nothing is deleted.
     files = {}
     if panel_settings.get("poll_delete_messages", True):
         guild = getattr(channel, "guild", None)
@@ -646,16 +646,16 @@ async def finish_poll(poll_id: int):
                 break
             budget -= len(data)
             ext = Path(urlparse(r["image"]).path).suffix.lower() or ".png"
-            files[r["number"]] = (f"miejsce_{r['place']}_{r['number']}{ext}", data)
+            files[r["number"]] = (f"place_{r['place']}_{r['number']}{ext}", data)
 
     embeds, attachments = [], []
     for r in top:
         emb = discord.Embed(
-            title=f"{MEDALS[r['place']]} {r['place']}. miejsce",
+            title=f"{MEDALS[r['place']]} Place {r['place']}",
             description=(
-                (f"Autor: <@{r['author_id']}>\n" if r["author_id"] else "")
-                + f"Liczba głosów: **{r['votes']}**"
-                + (" (remis)" if r["tie"] else "")
+                (f"Author: <@{r['author_id']}>\n" if r["author_id"] else "")
+                + f"Votes: **{r['votes']}**"
+                + (" (tie)" if r["tie"] else "")
             ),
             color=EMBED_COLOR,
         )
@@ -670,15 +670,15 @@ async def finish_poll(poll_id: int):
 
     kwargs = {"files": attachments} if attachments else {}
     await channel.send(
-        content="🏆 **Wyniki głosowania na tapetę miesiąca**", embeds=embeds, allowed_mentions=NO_PINGS, **kwargs
+        content="🏆 **Wallpaper of the month - results**", embeds=embeds, allowed_mentions=NO_PINGS, **kwargs
     )
 
-    if files:  # wyniki są już na kanale z własnymi kopiami obrazów - sprzątamy wiadomości z głosowania
+    if files:  # the results are in the channel with their own copies of the images - clean up the voting messages
         for r in results:
             try:
                 await r["message"].delete()
             except discord.HTTPException:
-                log.warning("Nie udało się usunąć wiadomości głosowania %s", r["message"].id)
+                log.warning("Could not delete voting message %s", r["message"].id)
         if header_id:
             try:
                 header = await channel.fetch_message(header_id)
@@ -695,7 +695,7 @@ async def check_polls():
         try:
             await finish_poll(poll_id)
         except Exception:
-            log.exception("Nie udało się zakończyć głosowania #%s", poll_id)
+            log.exception("Could not finish poll #%s", poll_id)
 
 
 @check_polls.before_loop
@@ -704,25 +704,25 @@ async def _before_check_polls():
 
 
 # ----------------------------------------------------------------------------
-# TAPETA MIESIĄCA: MENU /wallpaper
+# WALLPAPER OF THE MONTH: /wallpaper MENU
 # ----------------------------------------------------------------------------
 class WallpaperActionModal(discord.ui.Modal):
-    value = discord.ui.TextInput(label="ID głosowania lub użytkownika", max_length=100)
+    value = discord.ui.TextInput(label="Poll number or user ID", max_length=100)
 
     def __init__(self, action: str):
-        super().__init__(title="Tapeta: " + action)
+        super().__init__(title="Wallpaper: " + action)
         self.action = action
 
     async def on_submit(self, interaction: discord.Interaction):
-        if self.action == "anuluj":
+        if self.action == "cancel":
             if not is_allowed(interaction):
-                return await interaction.response.send_message("Nie masz uprawnień.", ephemeral=True)
+                return await interaction.response.send_message("You do not have permission.", ephemeral=True)
             try:
                 poll_id = int(self.value.value)
             except ValueError:
-                return await interaction.response.send_message("Podaj numer głosowania.", ephemeral=True)
+                return await interaction.response.send_message("Give the poll number.", ephemeral=True)
             await cancel_poll(interaction, poll_id)
-        elif self.action == "dodaj dostęp":
+        elif self.action == "grant":
             await grant_access(interaction, self.value.value)
         else:
             await revoke_access(interaction, self.value.value)
@@ -738,32 +738,32 @@ class WallpaperMenu(discord.ui.View):
             await interaction.response.send_message(f"⛔ {disabled_message()}", ephemeral=True)
             return False
         if interaction.user.id != self.owner_id or not is_allowed(interaction):
-            await interaction.response.send_message("Nie masz dostępu do tego panelu.", ephemeral=True)
+            await interaction.response.send_message("You do not have access to this panel.", ephemeral=True)
             return False
         return True
 
     @discord.ui.select(
-        placeholder="Wybierz, co chcesz zrobić",
+        placeholder="Choose what you want to do",
         options=[
-            discord.SelectOption(label="Utwórz głosowanie", value="start"),
-            discord.SelectOption(label="Aktywne głosowania", value="lista"),
-            discord.SelectOption(label="Anuluj głosowanie", value="anuluj"),
-            discord.SelectOption(label="Dodaj dostęp (Board)", value="dodaj dostęp"),
-            discord.SelectOption(label="Usuń dostęp (Board)", value="usuń dostęp"),
-            discord.SelectOption(label="Lista uprawnionych (Board)", value="dostęp"),
+            discord.SelectOption(label="Create a poll", value="create"),
+            discord.SelectOption(label="Active polls", value="list"),
+            discord.SelectOption(label="Cancel a poll", value="cancel"),
+            discord.SelectOption(label="Allow a user (Board)", value="grant"),
+            discord.SelectOption(label="Remove access (Board)", value="revoke"),
+            discord.SelectOption(label="List of allowed users (Board)", value="access"),
         ],
     )
     async def choose(self, interaction: discord.Interaction, select: discord.ui.Select):
         action = select.values[0]
-        if action in ("dodaj dostęp", "usuń dostęp", "dostęp") and not is_board(interaction):
+        if action in ("grant", "revoke", "access") and not is_board(interaction):
             return await interaction.response.send_message(
-                "Tylko rola Board może zarządzać dostępem.", ephemeral=True
+                "Only the Board role can manage access.", ephemeral=True
             )
-        if action == "start":
+        if action == "create":
             await interaction.response.send_modal(WallpaperCreateModal())
-        elif action == "lista":
+        elif action == "list":
             await show_active_polls(interaction)
-        elif action == "dostęp":
+        elif action == "access":
             await list_access(interaction)
         else:
             await interaction.response.send_modal(WallpaperActionModal(action))
@@ -773,38 +773,38 @@ class WallpaperMenu(discord.ui.View):
 @app_commands.guild_only()
 async def wallpaper(interaction: discord.Interaction):
     if not is_allowed(interaction):
-        return await interaction.response.send_message("Nie masz uprawnień do tapet.", ephemeral=True)
+        return await interaction.response.send_message("You do not have permission to manage wallpaper polls.", ephemeral=True)
     await interaction.response.send_message(
-        "Wybierz działanie:", view=WallpaperMenu(interaction.user.id), ephemeral=True
+        "Choose an action:", view=WallpaperMenu(interaction.user.id), ephemeral=True
     )
 
 
 # ----------------------------------------------------------------------------
-# POGODA: /metar i /taf (aviationweather.gov)
+# WEATHER: /metar and /taf (aviationweather.gov)
 # ----------------------------------------------------------------------------
 FLIGHT_CATEGORY_COLORS = {"VFR": 0x2ECC71, "MVFR": 0x3498DB, "IFR": 0xE74C3C, "LIFR": 0xC2185B}
-# widzialność tuż po grupie wiatru w surowym METAR: metry albo CAVOK
+# visibility right after the wind group in a raw METAR: metres or CAVOK
 VISIBILITY_RE = re.compile(r"\b(?:\d{3}|VRB)\d{2,3}(?:G\d{2,3})?KT(?: \d{3}V\d{3})? (CAVOK|\d{4})\b")
 
 
 def parse_icao(text: str) -> str:
     icao = text.strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{4}", icao):
-        raise UserError("Podaj czteroliterowy kod ICAO, np. EPWA.")
+        raise UserError("Give a four-character ICAO code, e.g. EPWA.")
     return icao
 
 
 def format_wind(m: dict) -> str:
     speed, gust, direction = m.get("wspd"), m.get("wgst"), m.get("wdir")
     if not speed:
-        return "Cisza"
+        return "Calm"
     if direction == "VRB":
-        text = f"zmienny / {speed} kt"
+        text = f"variable / {speed} kt"
     elif isinstance(direction, (int, float)):
         text = f"{int(direction):03d}° / {speed} kt"
     else:
         text = f"{speed} kt"
-    return text + (f"\nporywy {gust} kt" if gust else "")
+    return text + (f"\ngusts {gust} kt" if gust else "")
 
 
 def format_visibility(m: dict) -> str:
@@ -818,13 +818,13 @@ def format_visibility(m: dict) -> str:
         if visibility is None:
             return "—"
         if isinstance(visibility, str) and visibility.endswith("+"):
-            return "10 km lub więcej"
+            return "10 km or more"
         try:
-            meters = round(float(visibility) * 1609.344, -2)  # API podaje mile lądowe
+            meters = round(float(visibility) * 1609.344, -2)  # the API gives statute miles
         except (TypeError, ValueError):
             return str(visibility)
     if meters >= 9999:
-        return "10 km lub więcej"
+        return "10 km or more"
     if meters >= 1000:
         return f"{meters / 1000:g} km"
     return f"{int(meters)} m"
@@ -853,28 +853,28 @@ def build_metar_embed(m: dict, icao: str) -> discord.Embed:
     description = f"**{m['name']}**" if m.get("name") else ""
     if isinstance(m.get("obsTime"), (int, float)):
         observed = datetime.fromtimestamp(m["obsTime"], TZ)
-        description += f"\nObserwacja: {observed:%H:%M}Z, {observed:%d.%m} • <t:{int(m['obsTime'])}:R>"
+        description += f"\nObserved: {observed:%H:%M}Z, {observed:%d.%m} • <t:{int(m['obsTime'])}:R>"
     embed.description = description.strip() or None
 
     altimeter = m.get("altim")
-    embed.add_field(name="💨 Wiatr", value=format_wind(m))
-    embed.add_field(name="👁️ Widzialność", value=format_visibility(m))
-    embed.add_field(name="☁️ Chmury", value=format_clouds(m))
+    embed.add_field(name="💨 Wind", value=format_wind(m))
+    embed.add_field(name="👁️ Visibility", value=format_visibility(m))
+    embed.add_field(name="☁️ Clouds", value=format_clouds(m))
     embed.add_field(
-        name="🌡️ Temp. / punkt rosy",
+        name="🌡️ Temp. / dew point",
         value=f"{format_degrees(m.get('temp'))} / {format_degrees(m.get('dewp'))}",
     )
     embed.add_field(name="🔽 QNH", value=f"{round(altimeter)} hPa" if altimeter is not None else "—")
-    embed.add_field(name="✈️ Kategoria", value=category or "—")
+    embed.add_field(name="✈️ Category", value=category or "—")
     if m.get("wxString"):
-        embed.add_field(name="🌧️ Zjawiska", value=f"`{m['wxString']}`", inline=False)
-    embed.add_field(name="Raport", value=f"```\n{m.get('rawOb', '—')}\n```", inline=False)
-    embed.set_footer(text="Źródło: aviationweather.gov • czasy w UTC")
+        embed.add_field(name="🌧️ Weather", value=f"`{m['wxString']}`", inline=False)
+    embed.add_field(name="Report", value=f"```\n{m.get('rawOb', '—')}\n```", inline=False)
+    embed.set_footer(text="Source: aviationweather.gov • times in UTC")
     return embed
 
 
 def format_taf(raw: str) -> str:
-    """Rozbija TAF na linie: każdy BECMG / TEMPO / FM / PROBxx zaczyna nowy wiersz."""
+    """Splits a TAF into lines: every BECMG / TEMPO / FM / PROBxx starts a new row."""
     text = re.sub(r"\s+(?=(?:BECMG|TEMPO|FM\d{6}|PROB\d{2})\b)", "\n  ", raw.strip())
     return re.sub(r"(PROB\d{2})\n\s+(TEMPO)", r"\1 \2", text)
 
@@ -885,14 +885,14 @@ def build_taf_embed(t: dict, icao: str) -> discord.Embed:
         lines.append(f"**{t['name']}**")
     if isinstance(t.get("validTimeFrom"), (int, float)) and isinstance(t.get("validTimeTo"), (int, float)):
         start, end = datetime.fromtimestamp(t["validTimeFrom"], TZ), datetime.fromtimestamp(t["validTimeTo"], TZ)
-        lines.append(f"Ważny: {start:%d.%m %H:%M}Z → {end:%d.%m %H:%M}Z")
+        lines.append(f"Valid: {start:%d.%m %H:%M}Z → {end:%d.%m %H:%M}Z")
     raw = format_taf(t.get("rawTAF") or "")
     embed = discord.Embed(
         title=f"🌦️ TAF • {t.get('icaoId') or icao}",
         description=("\n".join(lines) + "\n" if lines else "") + f"```\n{raw[:3500]}\n```",
         color=EMBED_COLOR,
     )
-    embed.set_footer(text="Źródło: aviationweather.gov • czasy w UTC")
+    embed.set_footer(text="Source: aviationweather.gov • times in UTC")
     return embed
 
 
@@ -906,8 +906,8 @@ async def send_weather(interaction: discord.Interaction, icao: str, product: str
         data = await fetch(f"{WEATHER_API}/{product}", {"ids": station, "format": "json"})
         if not isinstance(data, list) or not data or not isinstance(data[0], dict):
             raise UserError(
-                f"Brak aktualnego {product.upper()} dla **{station}**. "
-                "To lotnisko może nie nadawać tego raportu - spróbuj innej stacji."
+                f"No current {product.upper()} for **{station}**. "
+                "This airport may not issue this report - try another station."
             )
         builder = build_metar_embed if product == "metar" else build_taf_embed
         embed = builder(data[0], station)
@@ -916,22 +916,22 @@ async def send_weather(interaction: discord.Interaction, icao: str, product: str
     await interaction.followup.send(embed=embed, allowed_mentions=NO_PINGS)
 
 
-@tree.command(name="metar", description="Aktualny METAR z aviationweather.gov")
-@app_commands.describe(icao="Kod ICAO lotniska, np. EPWA")
+@tree.command(name="metar", description="Current METAR from aviationweather.gov")
+@app_commands.describe(icao="Airport ICAO code, e.g. EPWA")
 async def metar(interaction: discord.Interaction, icao: str):
     await send_weather(interaction, icao, "metar")
 
 
-@tree.command(name="taf", description="Aktualny TAF z aviationweather.gov")
-@app_commands.describe(icao="Kod ICAO lotniska, np. EPKK")
+@tree.command(name="taf", description="Current TAF from aviationweather.gov")
+@app_commands.describe(icao="Airport ICAO code, e.g. EPKK")
 async def taf(interaction: discord.Interaction, icao: str):
     await send_weather(interaction, icao, "taf")
 
 
 # ----------------------------------------------------------------------------
-# REZERWACJE ATC: /bookings (atc-bookings.vatsim.net)
+# ATC BOOKINGS: /bookings (Core VACC API through CoreOPS)
 # ----------------------------------------------------------------------------
-# typ rezerwacji z API -> (znacznik, nazwa w legendzie); kolejność = kolejność legendy
+# booking type from the API -> (marker, name in the legend); order = order of the legend
 BOOKING_TYPES = {
     "training": ("🔹", "Training session"),
     "exam": ("🔸", "Exam"),
@@ -944,7 +944,7 @@ BOOKING_FILTERS = {
     "booking": {"booking"},
     "event": {"event"},
 }
-BOOKING_FIELDS_PER_EMBED = 24  # limit Discorda to 25 pól; 24 daje pełne rzędy po 3
+BOOKING_FIELDS_PER_EMBED = 24  # Discord allows 25 fields; 24 gives full rows of 3
 
 
 def booking_time(value) -> datetime:
@@ -962,14 +962,14 @@ def parse_day(text: str | None) -> datetime:
             return datetime.strptime(text.strip(), fmt).replace(tzinfo=TZ)
         except ValueError:
             pass
-    raise UserError("Podaj datę DD.MM.RRRR lub RRRR-MM-DD.")
+    raise UserError("Give the date as DD.MM.YYYY or YYYY-MM-DD.")
 
 
 async def load_polish_bookings(day: datetime) -> list[dict]:
-    """Rezerwacje z callsignami EP, które trwają w którejkolwiek chwili danego dnia (UTC).
+    """Bookings with the configured callsign prefixes (EP by default) active at any moment of the day (UTC).
 
-    API filtruje po dacie rozpoczęcia, więc pobieramy też dzień poprzedni - tak łapiemy sesje
-    przechodzące przez północ.
+    The API filters by start date, so the previous day is fetched too - that is how sessions
+    running through midnight are caught.
     """
     day_end = day + timedelta(days=1)
     found = {}
@@ -990,7 +990,7 @@ async def load_polish_bookings(day: datetime) -> list[dict]:
                     "ends": booking_time(item["end"]),
                 }
             except (KeyError, TypeError, ValueError, OverflowError):
-                log.warning("Pominięto niepoprawną rezerwację: %r", item)
+                log.warning("Skipped an invalid booking: %r", item)
                 continue
             if booking["begins"] < day_end and booking["ends"] > day:
                 key = item.get("id", (callsign, booking["begins"]))
@@ -1004,14 +1004,14 @@ def booking_marker(kind: str) -> str:
 
 def booking_hours(b: dict, day: datetime) -> str:
     def clock(moment: datetime) -> str:
-        # godzina; z datą tylko wtedy, gdy koniec/początek wypada poza oglądanym dniem
+        # time; with the date only when the start/end falls outside the day being viewed
         return f"{moment:%H:%M}" if moment.date() == day.date() else f"{moment:%Y-%m-%d %H:%M}"
 
     return f"{clock(b['begins'])} - {clock(b['ends'])} UTC"
 
 
 def build_booking_embeds(day: datetime, rows: list[dict]) -> list[discord.Embed]:
-    """Embedy w układzie: opis z legendą typów + pola po 3 w rzędzie (callsign, CID, godziny)."""
+    """Embeds laid out as: description with the type legend + fields in rows of 3 (callsign, CID, times)."""
     kinds = [k for k in BOOKING_TYPES if any(b["type"] == k for b in rows)]
     kinds += sorted({b["type"] for b in rows} - set(BOOKING_TYPES))
     description = f"Showing {len(rows)} {'booking' if len(rows) == 1 else 'bookings'} for date `{day:%Y-%m-%d}`."
@@ -1040,24 +1040,24 @@ def build_booking_embeds(day: datetime, rows: list[dict]) -> list[discord.Embed]
     return embeds
 
 
-@tree.command(name="bookings", description="Rezerwacje ATC w Polsce (callsigny EP)")
+@tree.command(name="bookings", description="ATC bookings in Poland (EP callsigns)")
 @app_commands.describe(
-    data="DD.MM.RRRR lub RRRR-MM-DD; domyślnie dzisiaj. Dzień według UTC.",
-    typ="Które rezerwacje pokazać; domyślnie wszystkie.",
+    date="DD.MM.YYYY or YYYY-MM-DD; default today. The day is in UTC.",
+    type="Which bookings to show; default all.",
 )
 @app_commands.choices(
-    typ=[
-        app_commands.Choice(name="Wszystkie", value="all"),
-        app_commands.Choice(name="Treningi i egzaminy", value="sessions"),
-        app_commands.Choice(name="Zwykłe rezerwacje", value="booking"),
-        app_commands.Choice(name="Eventy", value="event"),
+    type=[
+        app_commands.Choice(name="All", value="all"),
+        app_commands.Choice(name="Training and exams", value="sessions"),
+        app_commands.Choice(name="Normal bookings", value="booking"),
+        app_commands.Choice(name="Events", value="event"),
     ]
 )
 async def bookings(
-    interaction: discord.Interaction, data: str | None = None, typ: app_commands.Choice[str] | None = None
+    interaction: discord.Interaction, date: str | None = None, type: app_commands.Choice[str] | None = None
 ):
     try:
-        day = parse_day(data)
+        day = parse_day(date)
     except UserError as error:
         return await interaction.response.send_message(f"❌ {error}", ephemeral=True)
     await interaction.response.defer()
@@ -1066,7 +1066,7 @@ async def bookings(
     except UserError as error:
         return await interaction.followup.send(f"❌ {error}")
 
-    allowed_types = BOOKING_FILTERS.get(typ.value if typ else str(panel_settings.get("bookings_default_type") or "all"))
+    allowed_types = BOOKING_FILTERS.get(type.value if type else str(panel_settings.get("bookings_default_type") or "all"))
     if allowed_types is not None:
         rows = [b for b in rows if b["type"] in allowed_types]
 
@@ -1075,7 +1075,7 @@ async def bookings(
 
 
 # ----------------------------------------------------------------------------
-# ROLE PILOTÓW: /role
+# PILOT ROLES: /role
 # ----------------------------------------------------------------------------
 @tree.command(name="role", description="Give yourself the Training Pilot or Exam Pilot role (or remove it)")
 @app_commands.guild_only()
@@ -1097,7 +1097,7 @@ async def role(
     member = interaction.user
     bot_member = interaction.guild.me
     if selected is None:
-        return await interaction.followup.send("Nie znaleziono roli. Sprawdź skonfigurowane ID.", ephemeral=True)
+        return await interaction.followup.send("The role was not found. Check the configured ID.", ephemeral=True)
     if (
         not bot_member
         or not bot_member.guild_permissions.manage_roles
@@ -1105,45 +1105,45 @@ async def role(
         or selected.managed
     ):
         return await interaction.followup.send(
-            "Bot potrzebuje uprawnienia Zarządzanie rolami, a jego rola musi być ponad wybraną rolą pilota.",
+            "The bot needs the Manage Roles permission and its role must be above the pilot role.",
             ephemeral=True,
         )
     remove = action is not None and action.value == "remove"
     has_role = selected in member.roles
     if remove and not has_role:
-        return await interaction.followup.send(f"Nie masz roli **{selected.name}**.", ephemeral=True)
+        return await interaction.followup.send(f"You do not have the **{selected.name}** role.", ephemeral=True)
     if not remove and has_role:
-        return await interaction.followup.send(f"Masz już rolę **{selected.name}**.", ephemeral=True)
+        return await interaction.followup.send(f"You already have the **{selected.name}** role.", ephemeral=True)
     try:
         if remove:
-            await member.remove_roles(selected, reason="Samodzielny wybór /role")
+            await member.remove_roles(selected, reason="Self-service /role")
         else:
-            await member.add_roles(selected, reason="Samodzielny wybór /role")
+            await member.add_roles(selected, reason="Self-service /role")
         await interaction.followup.send(
-            f"✅ {'Usunięto' if remove else 'Dodano'} rolę **{selected.name}**.",
+            f"✅ {'Removed' if remove else 'Added'} the **{selected.name}** role.",
             ephemeral=True,
             allowed_mentions=NO_PINGS,
         )
     except discord.HTTPException:
-        log.exception("Nie udało się zmienić roli %s", selected.id)
+        log.exception("Could not change role %s", selected.id)
         await interaction.followup.send(
-            "Nie udało się zmienić roli. Sprawdź uprawnienia bota i spróbuj ponownie.", ephemeral=True
+            "Could not change the role. Check the bot's permissions and try again.", ephemeral=True
         )
 
 
 # ----------------------------------------------------------------------------
-# MODERACJA: /mod - sprawy trafiają do panelu CoreOPS (logi, zrzuty ekranu), ukarany dostaje wiadomość prywatną
+# MODERATION: /mod - cases go to the CoreOPS panel (log, screenshots), the punished person gets a private message
 # ----------------------------------------------------------------------------
 MOD_ACTIONS = {
-    "warn": ("⚠️", "Ostrzeżenie"),
-    "mute": ("🔇", "Wyciszenie"),
-    "unmute": ("🔊", "Zdjęcie wyciszenia"),
-    "timeout": ("⏸️", "Przerwa"),
-    "kick": ("👢", "Wyrzucenie z serwera"),
+    "warn": ("⚠️", "Warning"),
+    "mute": ("🔇", "Mute"),
+    "unmute": ("🔊", "Mute removed"),
+    "timeout": ("⏸️", "Timeout"),
+    "kick": ("👢", "Kick"),
     "ban": ("🔨", "Ban"),
-    "unban": ("✅", "Zdjęcie bana"),
+    "unban": ("✅", "Ban removed"),
 }
-# wiadomość prywatna do ukaranego jest po angielsku
+# titles of the private message sent to the punished person
 MOD_DM_TITLES = {
     "warn": "Warning",
     "mute": "Mute",
@@ -1161,16 +1161,16 @@ DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
 def parse_duration(text) -> int | None:
-    """'30m', '12h', '7d', '2w' -> sekundy; puste -> None (bezterminowo)."""
+    """'30m', '12h', '7d', '2w' -> seconds; empty -> None (permanent)."""
     text = str(text or "").strip().lower()
     if not text:
         return None
     match = re.fullmatch(r"(\d{1,3})\s*([mhdw])", text)
     if not match or int(match.group(1)) == 0:
-        raise UserError("Czas podaj jako liczbę z jednostką: 30m, 12h, 7d albo 2w (puste = bezterminowo).")
+        raise UserError("Give the duration as a number with a unit: 30m, 12h, 7d or 2w (empty = permanent).")
     seconds = int(match.group(1)) * DURATION_UNITS[match.group(2)]
     if seconds > MAX_DURATION_SECONDS:
-        raise UserError("Najdłuższy czas kary to 365 dni.")
+        raise UserError("The longest penalty is 365 days.")
     return seconds
 
 
@@ -1229,24 +1229,24 @@ async def apply_moderation(
     action_id: str = "",
     mod_member: discord.Member | None = None,
 ) -> tuple[int, str, str]:
-    """Wykonuje karę, wysyła wiadomość prywatną i zapisuje sprawę. Zwraca (numer sprawy, status DM, nazwa)."""
+    """Carries out the action, sends the private message and stores the case. Returns (case number, DM status, name)."""
     if action not in MOD_ACTIONS:
-        raise UserError("Nieznana akcja moderacyjna.")
+        raise UserError("Unknown moderation action.")
     reason = (reason or "").strip()[:500]
     if action in MOD_NEEDS_REASON and not reason:
-        raise UserError("Podaj powód.")
+        raise UserError("Give a reason.")
     if action not in MOD_TAKES_DURATION:
         duration_s = None
     if action == "timeout":
         if duration_s is None:
-            raise UserError("Przerwa wymaga czasu trwania, np. 30m, 12h, 7d.")
+            raise UserError("A timeout needs a duration, e.g. 30m, 12h, 7d.")
         if duration_s > MAX_TIMEOUT_SECONDS:
-            raise UserError("Przerwa może trwać najwyżej 28 dni.")
+            raise UserError("A timeout can last 28 days at most.")
     if (client.user and target_id == client.user.id) or (mod_id and target_id == mod_id):
-        raise UserError("Tej osoby nie można ukarać.")
+        raise UserError("This person cannot be punished.")
     me = guild.me
     if me is None:
-        raise UserError("Bot nie jest na serwerze.")
+        raise UserError("The bot is not on the server.")
 
     member = None
     if action != "unban":
@@ -1257,22 +1257,22 @@ async def apply_moderation(
             except discord.NotFound:
                 member = None
     if member is None and action not in ("ban", "unban"):
-        raise UserError("Tego użytkownika nie ma na serwerze.")
+        raise UserError("This user is not on the server.")
     if member is not None and action in ("mute", "timeout", "kick", "ban"):
         if member.id == guild.owner_id:
-            raise UserError("Nie można ukarać właściciela serwera.")
+            raise UserError("The server owner cannot be punished.")
         if member.top_role >= me.top_role:
-            raise UserError("Rola bota jest równa lub niższa niż rola tej osoby - przesuń rolę bota wyżej.")
+            raise UserError("The bot's role is equal to or lower than this person's role - move the bot's role higher.")
         if mod_member is not None and mod_member.id != guild.owner_id and member.top_role >= mod_member.top_role:
-            raise UserError("Ta osoba ma rolę równą lub wyższą niż Twoja.")
+            raise UserError("This person has a role equal to or higher than yours.")
 
     muted_role = None
     if action in ("mute", "unmute"):
         muted_role = guild.get_role(setting_id("muted_role_id", 0))
         if action == "mute" and muted_role is None:
-            raise UserError("Ustaw rolę Muted w panelu CoreOPS (Configuration → Discord bot → Settings).")
+            raise UserError("Set the Muted role in the CoreOPS panel (Configuration → Discord bot → Settings).")
         if muted_role is not None and (muted_role >= me.top_role or muted_role.managed):
-            raise UserError("Bot nie może nadawać roli Muted - jest ona ponad rolą bota.")
+            raise UserError("The bot cannot assign the Muted role - it is above the bot's role.")
 
     expires_ts = int(time.time()) + duration_s if duration_s else None
     target_name = str(member) if member else ""
@@ -1294,7 +1294,7 @@ async def apply_moderation(
     dm = "failed"
     try:
         if action in ("kick", "ban"):
-            # po wyrzuceniu bot nie ma już wspólnego serwera z użytkownikiem - wiadomość musi pójść wcześniej
+            # after a kick the bot no longer shares a server with the user - the message has to go first
             dm = await send_mod_dm(target_id, embed)
         if action == "mute":
             await member.add_roles(muted_role, reason=audit_reason)
@@ -1313,7 +1313,7 @@ async def apply_moderation(
             try:
                 await guild.unban(discord.Object(target_id), reason=audit_reason)
             except discord.NotFound:
-                raise UserError("Ten użytkownik nie ma bana.")
+                raise UserError("This user is not banned.")
         if action not in ("kick", "ban"):
             dm = await send_mod_dm(target_id, embed)
     except UserError:
@@ -1322,7 +1322,7 @@ async def apply_moderation(
     except discord.Forbidden as error:
         drop_case(case_id)
         raise UserError(
-            "Bot nie ma uprawnień do tej akcji (sprawdź jego uprawnienia i pozycję jego roli na liście ról)."
+            "The bot lacks permission for this action (check its permissions and the position of its role in the role list)."
         ) from error
     except Exception:
         drop_case(case_id)
@@ -1363,7 +1363,7 @@ def mark_cases_reported(case_ids: list[int]) -> None:
 
 async def run_mod_command(interaction: discord.Interaction, action: str, target, reason: str = "", duration=None):
     if not is_moderator(interaction):
-        return await interaction.response.send_message("Nie masz uprawnień do moderacji.", ephemeral=True)
+        return await interaction.response.send_message("You do not have permission to moderate.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     moderator = interaction.user if isinstance(interaction.user, discord.Member) else None
     try:
@@ -1382,69 +1382,69 @@ async def run_mod_command(interaction: discord.Interaction, action: str, target,
     except UserError as error:
         return await interaction.followup.send(f"❌ {error}", ephemeral=True)
     except discord.HTTPException as error:
-        log.exception("Błąd moderacji")
-        return await interaction.followup.send(f"❌ Błąd Discorda: {error}", ephemeral=True)
+        log.exception("Moderation error")
+        return await interaction.followup.send(f"❌ Discord error: {error}", ephemeral=True)
     dm_text = {
-        "sent": "Wiadomość prywatna wysłana.",
-        "failed": "Nie udało się wysłać wiadomości prywatnej (użytkownik ma zablokowane DM).",
+        "sent": "Private message sent.",
+        "failed": "The private message could not be delivered (the user has DMs blocked).",
     }.get(dm, "")
     await interaction.followup.send(
-        f"✅ {MOD_ACTIONS[action][1]}: **{name}** (`{target.id}`), sprawa **#{case_id}**. {dm_text}",
+        f"✅ {MOD_ACTIONS[action][1]}: **{name}** (`{target.id}`), case **#{case_id}**. {dm_text}",
         ephemeral=True,
         allowed_mentions=NO_PINGS,
     )
 
 
-mod_group = app_commands.Group(name="mod", description="Moderacja serwera", guild_only=True)
+mod_group = app_commands.Group(name="mod", description="Server moderation", guild_only=True)
 
 
-@mod_group.command(name="warn", description="Ostrzeżenie (z wiadomością prywatną)")
-@app_commands.describe(user="Kogo ostrzec", reason="Powód")
+@mod_group.command(name="warn", description="Warn a user (with a private message)")
+@app_commands.describe(user="Who to warn", reason="Reason")
 async def mod_warn(interaction: discord.Interaction, user: discord.Member, reason: str):
     await run_mod_command(interaction, "warn", user, reason)
 
 
-@mod_group.command(name="mute", description="Wyciszenie (rola Muted)")
-@app_commands.describe(user="Kogo wyciszyć", reason="Powód", duration="Czas: 30m, 12h, 7d, 2w (puste = bezterminowo)")
+@mod_group.command(name="mute", description="Mute a user (Muted role)")
+@app_commands.describe(user="Who to mute", reason="Reason", duration="Duration: 30m, 12h, 7d, 2w (empty = permanent)")
 async def mod_mute(interaction: discord.Interaction, user: discord.Member, reason: str, duration: str | None = None):
     await run_mod_command(interaction, "mute", user, reason, duration)
 
 
-@mod_group.command(name="unmute", description="Zdejmij wyciszenie i przerwę")
-@app_commands.describe(user="Komu zdjąć", reason="Powód (opcjonalnie)")
+@mod_group.command(name="unmute", description="Remove a mute and a timeout")
+@app_commands.describe(user="Who to unmute", reason="Reason (optional)")
 async def mod_unmute(interaction: discord.Interaction, user: discord.Member, reason: str | None = None):
     await run_mod_command(interaction, "unmute", user, reason or "")
 
 
-@mod_group.command(name="timeout", description="Przerwa (wbudowany timeout Discorda, do 28 dni)")
-@app_commands.describe(user="Kogo", duration="Czas: 30m, 12h, 7d, 2w", reason="Powód")
+@mod_group.command(name="timeout", description="Timeout (Discord's built-in timeout, up to 28 days)")
+@app_commands.describe(user="Who", duration="Duration: 30m, 12h, 7d, 2w", reason="Reason")
 async def mod_timeout(interaction: discord.Interaction, user: discord.Member, duration: str, reason: str):
     await run_mod_command(interaction, "timeout", user, reason, duration)
 
 
-@mod_group.command(name="kick", description="Wyrzuć z serwera")
-@app_commands.describe(user="Kogo wyrzucić", reason="Powód")
+@mod_group.command(name="kick", description="Kick from the server")
+@app_commands.describe(user="Who to kick", reason="Reason")
 async def mod_kick(interaction: discord.Interaction, user: discord.Member, reason: str):
     await run_mod_command(interaction, "kick", user, reason)
 
 
-@mod_group.command(name="ban", description="Zbanuj (opcjonalnie na czas)")
-@app_commands.describe(user="Kogo zbanować", reason="Powód", duration="Czas: 30m, 12h, 7d, 2w (puste = bezterminowo)")
+@mod_group.command(name="ban", description="Ban a user (optionally for a time)")
+@app_commands.describe(user="Who to ban", reason="Reason", duration="Duration: 30m, 12h, 7d, 2w (empty = permanent)")
 async def mod_ban(interaction: discord.Interaction, user: discord.User, reason: str, duration: str | None = None):
     await run_mod_command(interaction, "ban", user, reason, duration)
 
 
-@mod_group.command(name="unban", description="Zdejmij bana")
-@app_commands.describe(user="Kogo odbanować", reason="Powód (opcjonalnie)")
+@mod_group.command(name="unban", description="Remove a ban")
+@app_commands.describe(user="Who to unban", reason="Reason (optional)")
 async def mod_unban(interaction: discord.Interaction, user: discord.User, reason: str | None = None):
     await run_mod_command(interaction, "unban", user, reason or "")
 
 
-@mod_group.command(name="history", description="Historia kar użytkownika")
-@app_commands.describe(user="Czyją historię pokazać")
+@mod_group.command(name="history", description="A user's penalty history")
+@app_commands.describe(user="Whose history to show")
 async def mod_history(interaction: discord.Interaction, user: discord.User):
     if not is_moderator(interaction):
-        return await interaction.response.send_message("Nie masz uprawnień do moderacji.", ephemeral=True)
+        return await interaction.response.send_message("You do not have permission to moderate.", ephemeral=True)
     rows = db.execute(
         "SELECT id, ts, action, reason, mod_name FROM mod_cases WHERE target_id=? AND reported!=2 ORDER BY id DESC LIMIT 10",
         (user.id,),
@@ -1454,7 +1454,7 @@ async def mod_history(interaction: discord.Interaction, user: discord.User):
         for i, ts, action, reason, mod in rows
     ]
     await interaction.response.send_message(
-        "\n".join(lines) or "Brak spraw tego użytkownika.", ephemeral=True, allowed_mentions=NO_PINGS
+        "\n".join(lines) or "No cases for this user.", ephemeral=True, allowed_mentions=NO_PINGS
     )
 
 
@@ -1463,7 +1463,7 @@ tree.add_command(mod_group)
 
 @tasks.loop(seconds=30)
 async def check_mod_expiry():
-    """Automatyczne zdjęcie wyciszeń i banów czasowych."""
+    """Automatic removal of mutes and temporary bans."""
     guild = get_guild()
     if guild is None:
         return
@@ -1482,28 +1482,28 @@ async def check_mod_expiry():
                     except discord.NotFound:
                         member = None
                 if member is not None and role is not None and role in member.roles:
-                    await member.remove_roles(role, reason="Upłynął czas wyciszenia")
+                    await member.remove_roles(role, reason="The mute has expired")
                 undo = "unmute"
             elif action == "ban":
                 try:
-                    await guild.unban(discord.Object(target_id), reason="Upłynął czas bana")
+                    await guild.unban(discord.Object(target_id), reason="The ban has expired")
                 except discord.NotFound:
                     pass
                 undo = "unban"
             else:
                 undo = ""
         except discord.Forbidden:
-            log.warning("Brak uprawnień do automatycznego zdjęcia kary (sprawa #%s)", case_id)
+            log.warning("No permission to remove the penalty automatically (case #%s)", case_id)
             undo = ""
         except discord.HTTPException:
-            log.exception("Nie udało się zdjąć kary (sprawa #%s), spróbuję ponownie", case_id)
+            log.exception("Could not remove the penalty (case #%s), will retry", case_id)
             continue
         db.execute("UPDATE mod_cases SET active=0 WHERE id=?", (case_id,))
         if undo:
             db.execute(
                 "INSERT INTO mod_cases (ts, action, target_id, mod_name, reason, source, reported) "
-                "VALUES (?, ?, ?, 'Automatycznie', ?, 'auto', 0)",
-                (int(time.time()), undo, target_id, f"Upłynął czas kary ze sprawy #{case_id}"),
+                "VALUES (?, ?, ?, 'Automatic', ?, 'auto', 0)",
+                (int(time.time()), undo, target_id, f"The penalty of case #{case_id} has expired"),
             )
         db.commit()
 
@@ -1514,10 +1514,10 @@ async def _before_check_mod_expiry():
 
 
 # ----------------------------------------------------------------------------
-# WŁASNE KOMENDY RÓL: konfigurowane w CoreOPS (Configuration -> Discord bot -> Role commands)
+# CUSTOM ROLE COMMANDS: configured in CoreOPS (Configuration -> Discord bot -> Role commands)
 # ----------------------------------------------------------------------------
 RESERVED_COMMANDS = {"wallpaper", "metar", "taf", "bookings", "role", "mod"}
-# role z takimi uprawnieniami nigdy nie są nadawane komendą - pomyłka w panelu nie może dać nikomu admina
+# roles with these permissions are never handed out by a command - a mistake in the panel must not give anyone admin
 DANGEROUS_PERMISSIONS = (
     "administrator", "manage_guild", "manage_roles", "manage_channels", "manage_webhooks", "manage_messages",
     "kick_members", "ban_members", "moderate_members", "mention_everyone", "view_audit_log", "manage_nicknames",
@@ -1528,19 +1528,19 @@ dynamic_signature = ""
 
 def role_problem(guild: discord.Guild, role: discord.Role | None) -> str | None:
     if role is None:
-        return "nie ma takiej roli na serwerze"
+        return "there is no such role on the server"
     if role.is_default() or role.managed:
-        return "to rola systemowa lub integracji"
+        return "it is a system or integration role"
     reserved = {i for i in (board_role_id(), setting_id("moderator_role_id", 0), setting_id("muted_role_id", 0)) if i}
     if role.id in reserved:
-        return "ta rola jest zarezerwowana (Board / moderator / Muted)"
+        return "this role is reserved (Board / moderator / Muted)"
     me = guild.me
     if me is None or not me.guild_permissions.manage_roles:
-        return "bot nie ma uprawnienia Zarządzanie rolami"
+        return "the bot lacks the Manage Roles permission"
     if role >= me.top_role:
-        return "rola jest ponad rolą bota"
+        return "the role is above the bot's role"
     if any(getattr(role.permissions, name, False) for name in DANGEROUS_PERMISSIONS):
-        return "rola ma uprawnienia administracyjne - nie można jej nadawać komendą"
+        return "the role has administrative permissions - it cannot be handed out by a command"
     return None
 
 
@@ -1559,7 +1559,7 @@ def valid_role_specs() -> list[dict]:
         specs.append(
             {
                 "name": name,
-                "description": str(raw.get("description") or "").strip()[:100] or "Nadaj sobie rolę",
+                "description": str(raw.get("description") or "").strip()[:100] or "Give yourself a role",
                 "role_id": int(role_id),
                 "mode": mode,
                 "requires_role_id": int(required) if required.isdigit() else 0,
@@ -1572,7 +1572,7 @@ def role_command_report() -> list[dict]:
     guild = get_guild()
     out = []
     for spec in valid_role_specs():
-        problem = role_problem(guild, guild.get_role(spec["role_id"])) if guild else "bot nie widzi serwera"
+        problem = role_problem(guild, guild.get_role(spec["role_id"])) if guild else "the bot cannot see the server"
         out.append({"name": spec["name"], "ok": problem is None, "problem": problem or ""})
     return out
 
@@ -1580,31 +1580,31 @@ def role_command_report() -> list[dict]:
 async def handle_role_command(interaction: discord.Interaction, spec: dict):
     guild, member = interaction.guild, interaction.user
     if guild is None or not isinstance(member, discord.Member):
-        return await interaction.response.send_message("Ta komenda działa tylko na serwerze.", ephemeral=True)
+        return await interaction.response.send_message("This command only works on a server.", ephemeral=True)
     role = guild.get_role(spec["role_id"])
     problem = role_problem(guild, role)
     if problem:
-        return await interaction.response.send_message(f"Nie mogę nadać tej roli: {problem}.", ephemeral=True)
+        return await interaction.response.send_message(f"I cannot give this role: {problem}.", ephemeral=True)
     needed = spec["requires_role_id"]
     if needed and not any(r.id == needed for r in member.roles):
-        return await interaction.response.send_message("Ta komenda jest dostępna tylko dla osób z wymaganą rolą.", ephemeral=True)
+        return await interaction.response.send_message("This command is only available to members with the required role.", ephemeral=True)
     has_role = role in member.roles
     remove = spec["mode"] == "remove" or (spec["mode"] == "toggle" and has_role)
     if remove and not has_role:
-        return await interaction.response.send_message(f"Nie masz roli **{role.name}**.", ephemeral=True)
+        return await interaction.response.send_message(f"You do not have the **{role.name}** role.", ephemeral=True)
     if not remove and has_role:
-        return await interaction.response.send_message(f"Masz już rolę **{role.name}**.", ephemeral=True)
+        return await interaction.response.send_message(f"You already have the **{role.name}** role.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     try:
         if remove:
-            await member.remove_roles(role, reason=f"Komenda /{spec['name']}")
+            await member.remove_roles(role, reason=f"Command /{spec['name']}")
         else:
-            await member.add_roles(role, reason=f"Komenda /{spec['name']}")
+            await member.add_roles(role, reason=f"Command /{spec['name']}")
     except discord.HTTPException:
-        log.exception("Nie udało się zmienić roli %s", role.id)
-        return await interaction.followup.send("Nie udało się zmienić roli. Spróbuj ponownie później.", ephemeral=True)
+        log.exception("Could not change role %s", role.id)
+        return await interaction.followup.send("Could not change the role. Try again later.", ephemeral=True)
     await interaction.followup.send(
-        f"✅ {'Usunięto' if remove else 'Dodano'} rolę **{role.name}**.", ephemeral=True, allowed_mentions=NO_PINGS
+        f"✅ {'Removed' if remove else 'Added'} the **{role.name}** role.", ephemeral=True, allowed_mentions=NO_PINGS
     )
 
 
@@ -1617,7 +1617,7 @@ def make_role_command(spec: dict) -> app_commands.Command:
 
 
 async def refresh_role_commands(sync: bool) -> None:
-    """Rejestruje komendy ról z panelu (dodaje nowe, usuwa skasowane) i - gdy coś się zmieniło - synchronizuje z Discordem."""
+    """Registers the role commands from the panel (adds new ones, removes deleted ones) and syncs with Discord when something changed."""
     global dynamic_signature
     specs = valid_role_specs()
     signature = json.dumps(specs, sort_keys=True)
@@ -1636,18 +1636,18 @@ async def refresh_role_commands(sync: bool) -> None:
         try:
             await sync_commands()
         except discord.HTTPException:
-            log.exception("Nie udało się zsynchronizować komend ról")
+            log.exception("Could not sync the role commands")
 
 
 # ----------------------------------------------------------------------------
-# REZERWACJE: z API Core VACC, przez CoreOPS (token Core VACC zostaje w CoreOPS)
+# BOOKINGS: from the Core VACC API, through CoreOPS (the Core VACC token stays in CoreOPS)
 # ----------------------------------------------------------------------------
 _booking_cache: dict[str, tuple[float, list]] = {}
 
 
 async def coreops_bookings(date: str) -> list[dict]:
     if not (COREOPS_URL and COREOPS_TOKEN):
-        raise UserError("Rezerwacje pochodzą z Core VACC przez CoreOPS - w .env bota ustaw COREOPS_URL i COREOPS_TOKEN.")
+        raise UserError("Bookings come from Core VACC through CoreOPS - set COREOPS_URL and COREOPS_TOKEN in the bot's .env.")
     hit = _booking_cache.get(date)
     if hit and hit[0] > time.monotonic():
         return hit[1]
@@ -1660,12 +1660,12 @@ async def coreops_bookings(date: str) -> list[dict]:
             status = response.status
             data = await response.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
-        log.warning("Rezerwacje: brak połączenia z CoreOPS: %s: %s", type(error).__name__, error)
-        raise UserError("Nie udało się połączyć z CoreOPS. Spróbuj ponownie za chwilę.") from error
+        log.warning("Bookings: no connection to CoreOPS: %s: %s", type(error).__name__, error)
+        raise UserError("Could not connect to CoreOPS. Try again in a moment.") from error
     if status != 200 or not isinstance(data, dict) or not isinstance(data.get("bookings"), list):
         detail = str(data.get("detail") or data.get("error") or "") if isinstance(data, dict) else ""
-        log.warning("Rezerwacje z CoreOPS: HTTP %s %s", status, detail)
-        raise UserError("Nie udało się pobrać rezerwacji z Core VACC (sprawdź ustawienia API Core VACC w CoreOPS).")
+        log.warning("Bookings from CoreOPS: HTTP %s %s", status, detail)
+        raise UserError("Could not fetch the bookings from Core VACC (check the Core VACC API settings in CoreOPS).")
     if len(_booking_cache) > 50:
         _booking_cache.clear()
     _booking_cache[date] = (time.monotonic() + 60, data["bookings"])
@@ -1673,9 +1673,9 @@ async def coreops_bookings(date: str) -> list[dict]:
 
 
 # ----------------------------------------------------------------------------
-# PANEL COREOPS: ustawienia, stan i polecenia (co SYNC_SECONDS)
+# COREOPS PANEL: settings, state and commands (every SYNC_SECONDS)
 # ----------------------------------------------------------------------------
-pending_results: list[dict] = []  # wyniki poleceń do odesłania przy następnej wymianie
+pending_results: list[dict] = []  # command results to send back at the next exchange
 
 
 _commands_copied = False
@@ -1685,7 +1685,7 @@ async def sync_commands() -> None:
     global _commands_copied
     if GUILD_ID:
         guild = discord.Object(int(GUILD_ID))
-        if not _commands_copied:  # copy_global_to nie lubi być wywołane drugi raz (CommandAlreadyRegistered)
+        if not _commands_copied:  # copy_global_to must not be called twice (CommandAlreadyRegistered)
             tree.copy_global_to(guild=guild)
             _commands_copied = True
         await tree.sync(guild=guild)
@@ -1739,7 +1739,7 @@ def build_report() -> dict:
     }
 
 async def run_action(action: dict) -> tuple[bool, str]:
-    """Wykonuje polecenie z panelu. Zwraca (powodzenie, komunikat pokazywany w panelu)."""
+    """Carries out a panel command. Returns (success, message shown in the panel)."""
     kind = str(action.get("type") or "")
     payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
     if kind == "resync":
@@ -1751,7 +1751,7 @@ async def run_action(action: dict) -> tuple[bool, str]:
             return False, "The bot cannot find the server (check GUILD_ID)."
         poll_id, channel, _ = await create_poll(
             guild,
-            0,  # 0 = utworzone z panelu
+            0,  # 0 = created from the panel
             str(payload.get("entries", "")),
             str(payload.get("end", "")),
             str(payload.get("channels", "")),
@@ -1794,7 +1794,7 @@ async def run_action(action: dict) -> tuple[bool, str]:
             guild,
             str(payload.get("action", "")),
             int(uid),
-            0,  # 0 = z panelu CoreOPS
+            0,  # 0 = from the CoreOPS panel
             f"CoreOPS: {str(payload.get('moderator') or 'panel')[:60]}",
             str(payload.get("reason", "")),
             parse_duration(payload.get("duration")),
@@ -1812,11 +1812,11 @@ async def coreops_request(report: dict) -> dict | None:
         ) as response:
             if response.status != 200:
                 hint = {
-                    401: " - zły COREOPS_TOKEN (musi być taki sam jak bot.api_token w config.php)",
-                    403: " - zapora hostingu albo allowed_ips w CoreOPS blokuje to połączenie",
-                    406: " - zapora hostingu CoreOPS zablokowała żądanie",
-                    500: " - błąd po stronie CoreOPS (szczegóły niżej i w logu serwera)",
-                    503: " - w config.php CoreOPS brakuje bot.api_token (min. 32 znaki)",
+                    401: " - wrong COREOPS_TOKEN (it must equal bot.api_token in config.php)",
+                    403: " - the host firewall or allowed_ips in CoreOPS blocks this connection",
+                    406: " - the CoreOPS host firewall blocked the request",
+                    500: " - error on the CoreOPS side (details below and in the server log)",
+                    503: " - bot.api_token is missing in CoreOPS config.php (min. 32 characters)",
                 }.get(response.status, "")
                 detail = ""
                 try:
@@ -1824,17 +1824,17 @@ async def coreops_request(report: dict) -> dict | None:
                     detail = str(body.get("detail") or body.get("error") or "")[:200]
                 except (aiohttp.ClientError, ValueError, AttributeError):
                     pass
-                log.warning("CoreOPS odpowiedział kodem %s%s %s", response.status, hint, detail)
+                log.warning("CoreOPS answered with code %s%s %s", response.status, hint, detail)
                 return None
             data = await response.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
-        log.warning("Brak połączenia z CoreOPS: %s: %s", type(error).__name__, error)
+        log.warning("No connection to CoreOPS: %s: %s", type(error).__name__, error)
         return None
     return data if isinstance(data, dict) and data.get("ok") else None
 
 
 async def sync_with_coreops() -> int:
-    """Jedna wymiana z panelem. Zwraca liczbę wykonanych poleceń."""
+    """One exchange with the panel. Returns the number of commands carried out."""
     report = build_report()
     sent = len(report["results"])
     data = await coreops_request(report)
@@ -1849,7 +1849,7 @@ async def sync_with_coreops() -> int:
         try:
             CONFIG_CACHE.write_text(json.dumps(config), encoding="utf-8")
         except OSError:
-            log.warning("Nie można zapisać %s", CONFIG_CACHE)
+            log.warning("Cannot write %s", CONFIG_CACHE)
     done = 0
     for action in data.get("actions") or []:
         if not isinstance(action, dict) or not action.get("id"):
@@ -1858,8 +1858,8 @@ async def sync_with_coreops() -> int:
             ok, message = await run_action(action)
         except UserError as error:
             ok, message = False, str(error)
-        except Exception as error:  # jedno złe polecenie nie może zatrzymać synchronizacji
-            log.exception("Polecenie z panelu (%s) nie powiodło się", action.get("type"))
+        except Exception as error:  # one bad command must not stop the synchronisation
+            log.exception("Panel command (%s) failed", action.get("type"))
             ok, message = False, f"Bot error: {type(error).__name__}"
         pending_results.append({"id": str(action["id"]), "ok": ok, "message": message[:280]})
         done += 1
@@ -1872,9 +1872,9 @@ async def coreops_sync():
         return
     try:
         if await sync_with_coreops():
-            await sync_with_coreops()  # od razu odeślij wyniki, panel nie musi czekać kolejnych 15 s
+            await sync_with_coreops()  # send the results back at once so the panel does not wait another 15 s
     except Exception:
-        log.exception("Synchronizacja z CoreOPS nie powiodła się")
+        log.exception("Synchronisation with CoreOPS failed")
 
 
 @coreops_sync.before_loop
@@ -1883,15 +1883,15 @@ async def _before_coreops_sync():
 
 
 # ----------------------------------------------------------------------------
-# OBSŁUGA BŁĘDÓW I START
+# ERROR HANDLING AND START
 # ----------------------------------------------------------------------------
 @tree.error
 async def command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandOnCooldown):
-        message = f"Spróbuj ponownie za {error.retry_after:.0f} s."
+        message = f"Try again in {error.retry_after:.0f} s."
     else:
-        log.error("Komenda zakończyła się błędem", exc_info=error)
-        message = "Nie udało się wykonać komendy. Sprawdź log bota."
+        log.error("The command ended with an error", exc_info=error)
+        message = "The command could not be carried out. Check the bot's log."
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=True)
     else:
@@ -1900,9 +1900,9 @@ async def command_error(interaction: discord.Interaction, error: app_commands.Ap
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("Ustaw DISCORD_TOKEN w pliku .env obok bot.py.")
+        raise SystemExit("Set DISCORD_TOKEN in the .env file next to bot.py.")
     if COREOPS_URL and not COREOPS_TOKEN:
-        log.warning("COREOPS_URL jest ustawiony, ale brakuje COREOPS_TOKEN - panel CoreOPS nie będzie działał.")
+        log.warning("COREOPS_URL is set but COREOPS_TOKEN is missing - the CoreOPS panel will not work.")
     if COREOPS_URL.startswith("http://") and not re.match(r"http://(localhost|127\.0\.0\.1)(:\d+)?(/|$)", COREOPS_URL):
-        log.warning("COREOPS_URL używa http - token API przechodzi przez sieć jawnym tekstem. Użyj https.")
+        log.warning("COREOPS_URL uses http - the API token travels in clear text. Use https.")
     client.run(TOKEN)
