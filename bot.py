@@ -1331,6 +1331,19 @@ async def post_mod_log(
         embed.set_footer(text=ORG_NAME)
         await channel.send(embed=embed, allowed_mentions=NO_PINGS)
         modlog_error = ""
+    except discord.Forbidden:
+        other = client.get_channel(channel_id)
+        if other is not None and getattr(other, "guild", None) is not None and other.guild.id != guild.id:
+            modlog_error = f"channel {channel_id} belongs to another server ({other.guild.name}), not to {guild.name}"
+        else:
+            modlog_error = (
+                f"Missing Access: the bot cannot see channel {channel_id} on {guild.name}. Either this is not the ID of a channel "
+                "of this server, or the channel hides itself from the bot's role (it needs View Channel, Send Messages and Embed Links there)."
+            )
+        log.warning("Could not post to the moderation log channel %s: %s", channel_id, modlog_error)
+    except discord.NotFound:
+        modlog_error = f"channel {channel_id} does not exist - check the ID in the CoreOPS settings"
+        log.warning("Could not post to the moderation log channel %s: %s", channel_id, modlog_error)
     except (discord.HTTPException, AttributeError) as error:
         modlog_error = f"{type(error).__name__}: {error}"[:200]
         log.warning("Could not post to the moderation log channel %s: %s", channel_id, modlog_error)
@@ -1876,6 +1889,23 @@ def role_status(guild: discord.Guild | None, role_id: int) -> dict:
     return {"id": str(role_id), "name": role.name if role else None, "ok": ok}
 
 
+def own_permissions(guild: discord.Guild | None) -> dict | None:
+    """The bot's own role(s) on the server: what the invite really gave it."""
+    me = guild.me if guild else None
+    if me is None:
+        return None
+    perms = me.guild_permissions
+    return {
+        "administrator": perms.administrator,
+        "manage_roles": perms.manage_roles,
+        "kick_members": perms.kick_members,
+        "ban_members": perms.ban_members,
+        "moderate_members": perms.moderate_members,
+        "role": me.top_role.name,
+        "position": me.top_role.position,
+    }
+
+
 def effective_roles() -> dict:
     """The roles the bot actually uses (after the settings from CoreOPS), with their names on the server."""
     guild = get_guild()
@@ -1923,6 +1953,7 @@ def build_report() -> dict:
             "guilds": [{"id": str(g.id), "name": g.name} for g in client.guilds[:25]],  # to pick the Server ID from
             "commands_error": commands_error,
             "modlog_error": modlog_error,
+            "me": own_permissions(guild),
             "invite_url": invite_url(),
         },
         "polls": polls,
