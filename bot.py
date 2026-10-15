@@ -1161,9 +1161,16 @@ async def coreops_request(report: dict) -> dict | None:
                     401: " - zły COREOPS_TOKEN (musi być taki sam jak bot.api_token w config.php)",
                     403: " - zapora hostingu albo allowed_ips w CoreOPS blokuje to połączenie",
                     406: " - zapora hostingu CoreOPS zablokowała żądanie",
+                    500: " - błąd po stronie CoreOPS (szczegóły niżej i w logu serwera)",
                     503: " - w config.php CoreOPS brakuje bot.api_token (min. 32 znaki)",
                 }.get(response.status, "")
-                log.warning("CoreOPS odpowiedział kodem %s%s", response.status, hint)
+                detail = ""
+                try:
+                    body = await response.json(content_type=None)
+                    detail = str(body.get("detail") or body.get("error") or "")[:200]
+                except (aiohttp.ClientError, ValueError, AttributeError):
+                    pass
+                log.warning("CoreOPS odpowiedział kodem %s%s %s", response.status, hint, detail)
                 return None
             data = await response.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
