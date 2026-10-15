@@ -1174,6 +1174,28 @@ def parse_duration(text) -> int | None:
     return seconds
 
 
+def no_permission_text() -> str:
+    """The reply to someone who may not moderate - and what the bot knows, so a wrong setup is easy to spot."""
+    role_id = setting_id("moderator_role_id", 0)
+    lines = ["You do not have permission to moderate."]
+    if role_id:
+        lines.append(f"Moderator role set in CoreOPS: <@&{role_id}> - you do not have it.")
+    else:
+        lines.append(
+            "No moderator role is set in CoreOPS (Configuration → Discord bot → Settings), "
+            "so only the Board role and administrators may moderate."
+        )
+    if last_sync_ts:
+        lines.append(f"Settings last received from CoreOPS <t:{int(last_sync_ts)}:R>.")
+    else:
+        lines.append(
+            "The bot has not received any settings from CoreOPS yet"
+            + (f" ({last_sync_error})" if last_sync_error else "")
+            + " - check COREOPS_URL and COREOPS_TOKEN."
+        )
+    return "\n".join(lines)
+
+
 def is_moderator(interaction: discord.Interaction) -> bool:
     user = interaction.user
     if not isinstance(user, discord.Member):
@@ -1363,7 +1385,7 @@ def mark_cases_reported(case_ids: list[int]) -> None:
 
 async def run_mod_command(interaction: discord.Interaction, action: str, target, reason: str = "", duration=None):
     if not is_moderator(interaction):
-        return await interaction.response.send_message("You do not have permission to moderate.", ephemeral=True)
+        return await interaction.response.send_message(no_permission_text(), ephemeral=True, allowed_mentions=NO_PINGS)
     await interaction.response.defer(ephemeral=True)
     moderator = interaction.user if isinstance(interaction.user, discord.Member) else None
     try:
@@ -1444,7 +1466,7 @@ async def mod_unban(interaction: discord.Interaction, user: discord.User, reason
 @app_commands.describe(user="Whose history to show")
 async def mod_history(interaction: discord.Interaction, user: discord.User):
     if not is_moderator(interaction):
-        return await interaction.response.send_message("You do not have permission to moderate.", ephemeral=True)
+        return await interaction.response.send_message(no_permission_text(), ephemeral=True, allowed_mentions=NO_PINGS)
     rows = db.execute(
         "SELECT id, ts, action, reason, mod_name FROM mod_cases WHERE target_id=? AND reported!=2 ORDER BY id DESC LIMIT 10",
         (user.id,),
@@ -1676,6 +1698,8 @@ async def coreops_bookings(date: str) -> list[dict]:
 # COREOPS PANEL: settings, state and commands (every SYNC_SECONDS)
 # ----------------------------------------------------------------------------
 pending_results: list[dict] = []  # command results to send back at the next exchange
+last_sync_ts = 0.0  # when the settings were last received from CoreOPS
+last_sync_error = ""  # why the last exchange failed (empty = it worked)
 
 
 _commands_copied = False
@@ -1706,6 +1730,20 @@ def role_status(guild: discord.Guild | None, role_id: int) -> dict:
     return {"id": str(role_id), "name": role.name if role else None, "ok": ok}
 
 
+def effective_roles() -> dict:
+    """The roles the bot actually uses (after the settings from CoreOPS), with their names on the server."""
+    guild = get_guild()
+    out = {}
+    for key, role_id in (
+        ("board", board_role_id()),
+        ("moderator", setting_id("moderator_role_id", 0)),
+        ("muted", setting_id("muted_role_id", 0)),
+    ):
+        role = guild.get_role(role_id) if guild and role_id else None
+        out[key] = {"id": str(role_id) if role_id else "", "name": role.name if role else None}
+    return out
+
+
 def build_report() -> dict:
     guild = get_guild()
     latency = client.latency
@@ -1733,6 +1771,8 @@ def build_report() -> dict:
         "access": access,
         "roles": {kind: role_status(guild, pilot_role_id(kind)) for kind in PILOT_ROLES},
         "applied_rev": panel_rev,
+        "effective": effective_roles(),
+        "sync": {"last_ok_ts": int(last_sync_ts) or None, "last_error": last_sync_error},
         "role_commands": role_command_report(),
         "cases": unreported_cases(),
         "results": list(pending_results),
@@ -1806,6 +1846,7 @@ async def run_action(action: dict) -> tuple[bool, str]:
     return False, "Unknown command."
 
 async def coreops_request(report: dict) -> dict | None:
+    global last_sync_error
     try:
         async with client.web.post(
             f"{COREOPS_URL}/api/bot.php", json=report, headers={"Authorization": f"Bearer {COREOPS_TOKEN}"}
@@ -1825,21 +1866,28 @@ async def coreops_request(report: dict) -> dict | None:
                 except (aiohttp.ClientError, ValueError, AttributeError):
                     pass
                 log.warning("CoreOPS answered with code %s%s %s", response.status, hint, detail)
+                last_sync_error = f"HTTP {response.status}{hint} {detail}".strip()
                 return None
             data = await response.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
         log.warning("No connection to CoreOPS: %s: %s", type(error).__name__, error)
+        last_sync_error = f"no connection: {type(error).__name__}"
         return None
-    return data if isinstance(data, dict) and data.get("ok") else None
+    if isinstance(data, dict) and data.get("ok"):
+        return data
+    last_sync_error = "CoreOPS answered, but not with a valid reply"
+    return None
 
 
 async def sync_with_coreops() -> int:
     """One exchange with the panel. Returns the number of commands carried out."""
+    global last_sync_ts, last_sync_error
     report = build_report()
     sent = len(report["results"])
     data = await coreops_request(report)
     if data is None:
         return 0
+    last_sync_ts, last_sync_error = time.time(), ""
     del pending_results[:sent]
     mark_cases_reported([c["case_no"] for c in report.get("cases", [])])
     config = data.get("config")
@@ -1868,13 +1916,15 @@ async def sync_with_coreops() -> int:
 
 @tasks.loop(seconds=SYNC_SECONDS)
 async def coreops_sync():
+    global last_sync_error
     if not (COREOPS_URL and COREOPS_TOKEN):
         return
     try:
         if await sync_with_coreops():
             await sync_with_coreops()  # send the results back at once so the panel does not wait another 15 s
-    except Exception:
+    except Exception as error:
         log.exception("Synchronisation with CoreOPS failed")
+        last_sync_error = f"{type(error).__name__}: {error}"[:200]
 
 
 @coreops_sync.before_loop
